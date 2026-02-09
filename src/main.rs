@@ -2,7 +2,6 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -125,12 +124,8 @@ fn sample_throttle(buf: &mut [u8]) -> Vec<String> {
     v
 }
 
-fn sample_profile() -> String {
-    Command::new("powerprofilesctl")
-        .arg("get")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
+fn sample_profile(buf: &mut [u8]) -> String {
+    read_buf("/sys/firmware/acpi/platform_profile", buf)
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "?".into())
 }
@@ -215,7 +210,7 @@ fn take_sample(skip: &[u32], buf: &mut [u8], cores: u32) -> Sample {
     let cf = parse_u64(read_buf("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", buf).unwrap_or("0"));
     let cfm = parse_u64(read_buf("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq", buf).unwrap_or("0"));
     let thr = sample_throttle(buf);
-    let prof = sample_profile();
+    let prof = sample_profile(buf);
     let procs = sample_procs(skip, buf);
     Sample {
         cpu, mem_total: mt, mem_available: ma,
@@ -322,9 +317,12 @@ fn emit(prev: &Sample, cur: &Sample, first: bool, dur: Duration) {
     if !cur.throttled.is_empty() {
         tt.push_str(&format!("\n⚠ Throttled: {}", cur.throttled.join(", ")));
     }
-    if !top_cpu.is_empty() { tt.push_str(&format!("\n\n CPU\n{top_cpu}")); }
-    if !top_mem.is_empty() { tt.push_str(&format!("\n\n Memory\n{top_mem}")); }
-    if !top_io.is_empty() { tt.push_str(&format!("\n\n IO/s\n{top_io}")); }
+    let cpu_s = if top_cpu.is_empty() { "  ---" } else { &top_cpu };
+    let mem_s = if top_mem.is_empty() { "  ---" } else { &top_mem };
+    let io_s = if top_io.is_empty() { "  ---" } else { &top_io };
+    tt.push_str(&format!("\n\n CPU\n{cpu_s}"));
+    tt.push_str(&format!("\n\n Memory\n{mem_s}"));
+    tt.push_str(&format!("\n\n IO/s\n{io_s}"));
     tt.push_str(&format!("\n\nSampled in {:.1}ms", dur.as_secs_f64() * 1000.0));
 
     let out = WaybarOutput { text: cur.load1.clone(), tooltip: tt, class: class.into() };
