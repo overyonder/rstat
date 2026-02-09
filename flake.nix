@@ -1,5 +1,5 @@
 {
-  description = "Waybar syshealth streaming daemon";
+  description = "Waybar syshealth streaming daemon (eBPF)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -14,11 +14,34 @@
   in {
     packages = forAllSystems (system: let
       pkgs = nixpkgs.legacyPackages.${system};
+      probe = pkgs.stdenv.mkDerivation {
+        pname = "rstat-probe";
+        version = "0.1.0";
+        src = ./src;
+        sourceRoot = ".";
+        nativeBuildInputs = [pkgs.llvmPackages.clang-unwrapped];
+        buildInputs = [pkgs.libbpf];
+        dontUnpack = true;
+        buildPhase = ''
+          ${pkgs.llvmPackages.clang-unwrapped}/bin/clang \
+            -target bpf -O2 -g \
+            -I${pkgs.libbpf}/include \
+            -I$src \
+            -c $src/probe.bpf.c -o probe.bpf.o
+        '';
+        installPhase = ''
+          mkdir -p $out
+          cp probe.bpf.o $out/
+        '';
+      };
       rstat = pkgs.rustPlatform.buildRustPackage {
         pname = "rstat";
         version = "0.1.0";
         src = ./.;
-        cargoHash = "sha256-wLRw3F8cH8fmeKPZ01+lJCwLPhccDjEwmcOvdlI2BCw=";
+        cargoHash = "sha256-uhjr5c9r5hr8vLWKyhbHCv11G/fLb8IYVfKjCNcE6Jw=";
+        postInstall = ''
+          cp ${probe}/probe.bpf.o $out/bin/
+        '';
       };
     in {
       default = rstat;
