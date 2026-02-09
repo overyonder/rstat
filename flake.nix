@@ -38,7 +38,7 @@
         pname = "rstat";
         version = "0.1.0";
         src = ./.;
-        cargoHash = "sha256-uhjr5c9r5hr8vLWKyhbHCv11G/fLb8IYVfKjCNcE6Jw=";
+        cargoHash = "sha256-1O6RRWztQXukeM6WAc2KEbNRRhsAVxqr5MhtcTelFeo=";
         postInstall = ''
           cp ${probe}/probe.bpf.o $out/bin/
         '';
