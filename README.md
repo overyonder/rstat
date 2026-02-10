@@ -54,13 +54,43 @@ The binary requires `CAP_SYS_ADMIN` (or equivalent, e.g. NixOS `security.wrapper
 
 ## Waybar integration
 
-```json
+```jsonc
 "custom/sysmon": {
     "exec": "rstat",
     "return-type": "json",
-    "restart-interval": 0
+    "restart-interval": 0,
+    "on-scroll-up": "kill -USR1 $(pgrep rstat)",
+    "on-scroll-down": "kill -USR2 $(pgrep rstat)",
+    "on-click": "kill -RTMIN $(pgrep rstat)"
 }
 ```
+
+## Interval control
+
+The update interval defaults to 2000ms and can be changed at runtime via Unix
+signals:
+
+| Signal   | Action                          | Waybar event |
+|----------|---------------------------------|--------------|
+| SIGUSR1  | Halve interval (min 16ms)       | scroll-up    |
+| SIGUSR2  | Double interval (max 5000ms)    | scroll-down  |
+| SIGRTMIN | Reset to 2000ms                 | click        |
+
+The current interval is shown in the tooltip as `(every Xms)`.
+
+```sh
+kill -USR1 $(pgrep rstat)   # faster
+kill -USR2 $(pgrep rstat)   # slower
+kill -RTMIN $(pgrep rstat)  # reset
+```
+
+## Benchmarking
+
+```sh
+sudo ./target/release/rstat --bench 200
+```
+
+Runs 200 sample iterations and prints p50/p95/p99 latencies.
 
 ## Writeup
 

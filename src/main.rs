@@ -1,10 +1,14 @@
 use std::fmt::Write as FmtWrite;
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, RawFd};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fs, thread};
 use std::time::{Duration, Instant};
 
-const INTERVAL: Duration = Duration::from_secs(2);
+const DEFAULT_MS: u64 = 2000;
+const MIN_MS: u64 = 16;
+const MAX_MS: u64 = 5000;
+static INTERVAL_MS: AtomicU64 = AtomicU64::new(DEFAULT_MS);
 const PAGE_SIZE: u64 = 4096;
 const GPU_DIR: &str = "/sys/class/drm/card1/gt/gt0";
 const TOP_N: usize = 5;
@@ -720,7 +724,8 @@ fn emit(prev: Option<&Sample>, cur: &mut Sample, dur: Duration, tt: &mut String,
             let _ = write!(tt, "\n{t:5.1}M/s  {} (R:{r:.1} W:{w:.1})", comm_str(&e.comm, e.cl));
         }
     }
-    let _ = write!(tt, "\n\nSampled in {:.1}ms", dur.as_secs_f64() * 1000.0);
+    let ival = INTERVAL_MS.load(Ordering::Relaxed);
+    let _ = write!(tt, "\n\nSampled in {:.1}ms (every {ival}ms)", dur.as_secs_f64() * 1000.0);
 
     // Build JSON directly
     json.clear();
@@ -741,12 +746,65 @@ fn emit(prev: Option<&Sample>, cur: &mut Sample, dur: Duration, tt: &mut String,
     let _ = lock.flush();
 }
 
+// --- Signal-based interval control ---
+
+extern "C" fn sig_faster(_: libc::c_int) {
+    let v = INTERVAL_MS.load(Ordering::Relaxed);
+    INTERVAL_MS.store((v / 2).max(MIN_MS), Ordering::Relaxed);
+}
+
+extern "C" fn sig_slower(_: libc::c_int) {
+    let v = INTERVAL_MS.load(Ordering::Relaxed);
+    INTERVAL_MS.store((v * 2).min(MAX_MS), Ordering::Relaxed);
+}
+
+extern "C" fn sig_reset(_: libc::c_int) {
+    INTERVAL_MS.store(DEFAULT_MS, Ordering::Relaxed);
+}
+
+fn install_signal(sig: libc::c_int, handler: extern "C" fn(libc::c_int)) {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = handler as usize;
+        sa.sa_flags = libc::SA_RESTART;
+        libc::sigaction(sig, &sa, std::ptr::null_mut());
+    }
+}
+
+/// Sleep for `ms` milliseconds using nanosleep. If a signal arrives (EINTR)
+/// and the interval has decreased, return immediately so the faster rate
+/// takes effect without waiting out the old remainder.
+fn sleep_or_signal(ms: u64) {
+    let mut ts = libc::timespec {
+        tv_sec: (ms / 1000) as libc::time_t,
+        tv_nsec: ((ms % 1000) * 1_000_000) as libc::c_long,
+    };
+    loop {
+        let mut rem: libc::timespec = unsafe { std::mem::zeroed() };
+        let r = unsafe { libc::nanosleep(&ts, &mut rem) };
+        if r == 0 { break; }
+        // EINTR -- a signal fired
+        let now = INTERVAL_MS.load(Ordering::Relaxed);
+        if now < ms {
+            // Interval decreased (scroll-up / faster): wake immediately
+            break;
+        }
+        // Interval same or increased: sleep the remainder
+        ts = rem;
+    }
+}
+
 fn main() {
     let mut buf = [0u8; 64];
     let me = std::process::id();
     let parent = unsafe { libc::getppid() } as u32;
     let cores = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) } as u32;
     let mut fds = SysFds::open();
+
+    install_signal(libc::SIGUSR1, sig_faster);
+    install_signal(libc::SIGUSR2, sig_slower);
+    install_signal(libc::SIGRTMIN(), sig_reset);
+
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     let probe_path = args.iter().find(|a| a.ends_with(".bpf.o"))
@@ -812,7 +870,7 @@ fn main() {
     let mut prev_sample = s;
 
     loop {
-        thread::sleep(INTERVAL);
+        sleep_or_signal(INTERVAL_MS.load(Ordering::Relaxed));
         let t0 = Instant::now();
         let es = t0.duration_since(prev_sample.ts).as_secs_f64();
         bpf.read_stats(&mut cur);
