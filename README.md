@@ -55,6 +55,8 @@ The result: a complete system health snapshot (CPU%, memory, load, temperature, 
 
 ## Building
 
+Rust, by the way. On NixOS, by the way.
+
 Requires Nix with flakes:
 
 ```sh
