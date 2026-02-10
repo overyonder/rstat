@@ -69,6 +69,28 @@ impl IoTop5 {
     }
 }
 
+const MAX_BLOCKED: usize = 10;
+#[derive(Clone, Copy)]
+struct StateEntry { state: u8, comm: [u8; COMM_LEN], cl: u8 }
+const EMPTY_SE: StateEntry = StateEntry { state: 0, comm: [0; COMM_LEN], cl: 0 };
+
+struct StateList { e: [StateEntry; MAX_BLOCKED], n: usize }
+impl StateList {
+    fn new() -> Self { Self { e: [EMPTY_SE; MAX_BLOCKED], n: 0 } }
+    fn push(&mut self, state: u8, comm: &[u8]) {
+        if self.n >= MAX_BLOCKED { return; }
+        let mut c = [0u8; COMM_LEN];
+        let l = comm.len().min(COMM_LEN);
+        c[..l].copy_from_slice(&comm[..l]);
+        self.e[self.n] = StateEntry { state, comm: c, cl: l as u8 };
+        self.n += 1;
+    }
+    fn sorted(&mut self) -> &[StateEntry] {
+        self.e[..self.n].sort_unstable_by_key(|e| e.state);
+        &self.e[..self.n]
+    }
+}
+
 #[inline]
 fn comm_str(c: &[u8; COMM_LEN], l: u8) -> &str {
     unsafe { std::str::from_utf8_unchecked(&c[..l as usize]) }
@@ -208,6 +230,7 @@ struct BpfPidStats {
     io_rb: u64,
     io_wb: u64,
     comm: [u8; 16],
+    state: u8,
 }
 
 #[repr(C)]
@@ -498,6 +521,7 @@ struct Sample {
     top_cpu: Top5,
     top_mem: Top5,
     top_io: IoTop5,
+    blocked: StateList,
     ts: Instant,
 }
 
@@ -553,6 +577,7 @@ fn take_sample(
     let mut top_cpu = Top5::new();
     let mut top_mem = Top5::new();
     let mut top_io = IoTop5::new();
+    let mut blocked = StateList::new();
     let min_io = if elapsed_s > 0.0 { (MIN_IO_BYTES as f64 * elapsed_s) as u64 } else { u64::MAX };
     let mut busy_ns = 0u64;
 
@@ -560,6 +585,9 @@ fn take_sample(
         if pid == me || pid == parent || pid == 0 { continue; }
         let cl = st.comm.iter().position(|&b| b == 0).unwrap_or(16);
         if cl == 0 { continue; }
+        if st.state == b'D' || st.state == b'Z' {
+            blocked.push(st.state, &st.comm[..cl]);
+        }
 
         let prev_st = prev.get(pid);
         let prev_cpu = prev_st.map(|p| p.cpu_ns).unwrap_or(0);
@@ -589,7 +617,7 @@ fn take_sample(
         gpu_rc6_ms: rc6, gpu_freq: gf, gpu_max: gm,
         cpu_temp: ct, cpu_freq: cf, cpu_fmax: cfm,
         throttle: thr, profile, profile_len: pl as u8,
-        top_cpu, top_mem, top_io, ts: Instant::now(),
+        top_cpu, top_mem, top_io, blocked, ts: Instant::now(),
     }
 }
 
@@ -655,15 +683,18 @@ fn emit(prev: Option<&Sample>, cur: &mut Sample, dur: Duration, tt: &mut String,
     let _ = write!(tt, "{ct}°C    ");
     if prev.is_some() { let _ = write!(tt, "{:.0}", cur.cpu_pct); } else { tt.push('?'); }
     let _ = write!(tt, "%    {cf:.1}/{cfm:.1} GHz");
+    let blk = cur.blocked.sorted();
+    for e in blk {
+        let _ = write!(tt, "\n    {}  {}", e.state as char, comm_str(&e.comm, e.cl));
+    }
     let entries = cur.top_cpu.sorted();
-    if entries.is_empty() {
+    if entries.is_empty() && blk.is_empty() {
         tt.push_str("\n  ---");
-    } else {
-        let total_ns = elapsed_s * cur.cores as f64 * 1_000_000_000.0;
-        for e in entries {
-            let pct = if total_ns > 0.0 { e.val as f64 * 100.0 / total_ns } else { 0.0 };
-            let _ = write!(tt, "\n{pct:5.1}%  {}", comm_str(&e.comm, e.cl));
-        }
+    }
+    let total_ns = elapsed_s * cur.cores as f64 * 1_000_000_000.0;
+    for e in entries {
+        let pct = if total_ns > 0.0 { e.val as f64 * 100.0 / total_ns } else { 0.0 };
+        let _ = write!(tt, "\n{pct:5.1}%  {}", comm_str(&e.comm, e.cl));
     }
 
     let _ = write!(tt, "\n\n Memory    {mused_g:.1}/{mtotal_g:.1} GiB ({mpct}%)");

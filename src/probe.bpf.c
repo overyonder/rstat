@@ -15,6 +15,7 @@ struct pid_stats {
     __u64 io_rb;        // cumulative read_bytes from task->ioac
     __u64 io_wb;        // cumulative write_bytes from task->ioac
     char  comm[TASK_COMM_LEN];
+    __u8  state;        // 'D' = uninterruptible, 'Z' = zombie, 0 = normal
 };
 
 // System-wide counters
@@ -124,9 +125,13 @@ int handle_sched_switch(struct sched_switch_args *ctx)
             if (s) {
                 __sync_fetch_and_add(&s->cpu_ns, delta);
                 snapshot_task(s);
+                if (ctx->prev_state & 0x02)
+                    s->state = 'D';
             } else {
                 struct pid_stats ns = {};
                 ns.cpu_ns = delta;
+                if (ctx->prev_state & 0x02)
+                    ns.state = 'D';
                 read_tp_comm(ns.comm, ctx->prev_comm);
                 snapshot_task(&ns);
                 bpf_map_update_elem(&stats, &prev, &ns, BPF_NOEXIST);
@@ -138,6 +143,13 @@ int handle_sched_switch(struct sched_switch_args *ctx)
     // Record schedule-in time for next (including idle/PID 0)
     struct sched_in new_si = { .ts = now };
     bpf_map_update_elem(&sched_start, &next, &new_si, BPF_ANY);
+
+    // Clear D-state for next (it's running now)
+    if (next != 0) {
+        struct pid_stats *ns = bpf_map_lookup_elem(&stats, &next);
+        if (ns && ns->state == 'D')
+            ns->state = 0;
+    }
 
     return 0;
 }
@@ -155,6 +167,28 @@ struct sched_process_exit_args {
 
 SEC("tracepoint/sched/sched_process_exit")
 int handle_sched_exit(struct sched_process_exit_args *ctx)
+{
+    __u32 pid = ctx->pid;
+    bpf_map_delete_elem(&sched_start, &pid);
+    struct pid_stats *s = bpf_map_lookup_elem(&stats, &pid);
+    if (s)
+        s->state = 'Z';
+    return 0;
+}
+
+// Clean up on process reap (zombie -> freed)
+struct sched_process_free_args {
+    unsigned short common_type;
+    unsigned char  common_flags;
+    unsigned char  common_preempt_count;
+    int            common_pid;
+    char           comm[16];
+    int            pid;
+    int            prio;
+};
+
+SEC("tracepoint/sched/sched_process_free")
+int handle_sched_free(struct sched_process_free_args *ctx)
 {
     __u32 pid = ctx->pid;
     bpf_map_delete_elem(&sched_start, &pid);
