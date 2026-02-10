@@ -2,6 +2,8 @@
 
 **A system monitor that runs inside the kernel. Sub-millisecond samples. Zero allocations. Faster than `top`.**
 
+<img src="https://over-yonder.tech/assets/rstat-hero.webp" alt="rstat Waybar tooltip showing CPU, memory, IO breakdown, sampled in 2.9ms" width="100%" />
+
 Most system monitors read `/proc` -- opening, reading, and closing thousands of files every refresh cycle. `top` does it. `btop` does it. They parse ASCII text the kernel formatted from data structures it already had in memory. It is a serialisation round-trip through the filesystem for numbers the kernel could hand you directly.
 
 `rstat` skips all of that. It injects verified eBPF bytecode into the kernel's scheduler path. When the CPU switches between tasks, the probe reads CPU time, RSS, and IO counters directly from `task_struct` -- no files, no syscalls, no text parsing. Userspace reads the results from a BPF map in a single batch operation.
@@ -11,25 +13,6 @@ The result: a complete system health snapshot (CPU%, memory, load, temperature, 
 [![Read the full writeup](https://img.shields.io/badge/Read_the_writeup-over--yonder.tech-1a6e2e?style=for-the-badge)](https://over-yonder.tech/#articles/rstat)
 
 ## How it works
-
-```
-                    Ring 0 (Kernel)
-    ┌─────────────────────────────────────────┐
-    │  eBPF Sandbox          Kernel Structs   │
-    │  ┌─────────────┐      ┌──────────────┐  │
-    │  │ Verified     │◄─────│ task_struct   │  │
-    │  │ bytecode     │◄─────│ mm_struct     │  │
-    │  │              │◄─────│ task->ioac    │  │
-    │  └──────┬───────┘      └──────────────┘  │
-    │         │ writes to BPF map              │
-    ├─────────┼────────────────────────────────┤
-    │         ▼           Ring 3 (Userspace)   │
-    │  ┌──────────────┐                        │
-    │  │ rstat daemon  │──► Waybar (JSON)      │
-    │  │ 1 batch read  │                       │
-    │  └──────────────┘                        │
-    └─────────────────────────────────────────┘
-```
 
 **Three BPF tracepoint probes:**
 - `sched_switch` -- accounts CPU time, snapshots RSS and IO for the outgoing task
