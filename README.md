@@ -1,6 +1,6 @@
 # rstat
 
-**A system monitor that runs inside the kernel. Sub-millisecond samples. Zero allocations. Faster than `top`.**
+**A system monitor that runs inside the kernel. Sub-millisecond samples. Faster than `top`.**
 
 <img src="https://over-yonder.tech/assets/rstat-hero.webp" alt="rstat Waybar tooltip showing CPU, memory, IO breakdown, sampled in 2.9ms" width="100%" />
 
@@ -8,7 +8,7 @@ Most system monitors read `/proc` -- opening, reading, and closing thousands of 
 
 `rstat` skips all of that. It injects verified eBPF bytecode into the kernel's scheduler path. When the CPU switches between tasks, the probe reads CPU time, RSS, and IO counters directly from `task_struct` -- no files, no syscalls, no text parsing. Userspace reads the results from a BPF map in a single batch operation.
 
-The result: a complete system health snapshot (CPU%, memory, load, temperature, frequency, GPU, power profile, top-5 processes by CPU/memory/IO with per-process breakdowns) in **under 1 millisecond** on a quiet desktop, with **zero heap allocations** in the steady-state hot path.
+The result: a complete system health snapshot (CPU%, memory, load, temperature, frequency, GPU, power profile, top-5 processes by CPU/memory/IO with per-process breakdowns) in **under 1 millisecond** on a quiet desktop.
 
 [![Read the full writeup](https://img.shields.io/badge/Read_the_writeup-over--yonder.tech-1a6e2e?style=for-the-badge)](https://over-yonder.tech/#articles/rstat)
 
@@ -23,7 +23,7 @@ The result: a complete system health snapshot (CPU%, memory, load, temperature, 
 - Custom ELF loader (no aya, no libbpf-rs, no tokio, no C build step)
 - Batch map reads with pre-allocated arrays
 - Hand-written JSON emitter (no serde)
-- All buffers pre-allocated and reused; zero `malloc` in the hot path
+- All buffers pre-allocated and reused
 
 ## Performance
 
@@ -32,7 +32,7 @@ The result: a complete system health snapshot (CPU%, memory, load, temperature, 
 | Bash + coreutils | ~2,000 ms | Fork 10-15 subprocesses per sample |
 | Rust + /proc | ~700 ms | Direct /proc parsing, one subprocess remained |
 | Optimised /proc | ~15 ms | Sysfs, reusable buffers, byte-level parsing |
-| **eBPF + zero-alloc** | **<1 ms** | BPF probes, batch map reads, hand-written JSON |
+| **eBPF** | **<1 ms** | BPF probes, batch map reads, hand-written JSON |
 
 ~200 KB RSS. <0.01% CPU. Two runtime dependencies (`libc`, `goblin`).
 
