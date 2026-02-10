@@ -5,10 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fs, thread};
 use std::time::{Duration, Instant};
 
-const DEFAULT_MS: u64 = 2000;
-const MIN_MS: u64 = 16;
-const MAX_MS: u64 = 5000;
-static INTERVAL_MS: AtomicU64 = AtomicU64::new(DEFAULT_MS);
+const INTERVALS: [u64; 6] = [2000, 1000, 500, 250, 100, 2000];
+static INTERVAL_MS: AtomicU64 = AtomicU64::new(2000);
 const PAGE_SIZE: u64 = 4096;
 const GPU_DIR: &str = "/sys/class/drm/card1/gt/gt0";
 const TOP_N: usize = 5;
@@ -746,52 +744,20 @@ fn emit(prev: Option<&Sample>, cur: &mut Sample, dur: Duration, tt: &mut String,
     let _ = lock.flush();
 }
 
-// --- Signal-based interval control ---
+// --- Click-to-cycle interval control ---
 
-extern "C" fn sig_faster(_: libc::c_int) {
-    let v = INTERVAL_MS.load(Ordering::Relaxed);
-    INTERVAL_MS.store((v / 2).max(MIN_MS), Ordering::Relaxed);
+extern "C" fn sig_cycle(_: libc::c_int) {
+    let cur = INTERVAL_MS.load(Ordering::Relaxed);
+    let next = INTERVALS.iter().skip_while(|&&v| v != cur).nth(1).copied().unwrap_or(INTERVALS[0]);
+    INTERVAL_MS.store(next, Ordering::Relaxed);
 }
 
-extern "C" fn sig_slower(_: libc::c_int) {
-    let v = INTERVAL_MS.load(Ordering::Relaxed);
-    INTERVAL_MS.store((v * 2).min(MAX_MS), Ordering::Relaxed);
-}
-
-extern "C" fn sig_reset(_: libc::c_int) {
-    INTERVAL_MS.store(DEFAULT_MS, Ordering::Relaxed);
-}
-
-fn install_signal(sig: libc::c_int, handler: extern "C" fn(libc::c_int)) {
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = handler as usize;
-        sa.sa_flags = libc::SA_RESTART;
-        libc::sigaction(sig, &sa, std::ptr::null_mut());
-    }
-}
-
-/// Sleep for `ms` milliseconds using nanosleep. If a signal arrives (EINTR)
-/// and the interval has decreased, return immediately so the faster rate
-/// takes effect without waiting out the old remainder.
 fn sleep_or_signal(ms: u64) {
-    let mut ts = libc::timespec {
+    let ts = libc::timespec {
         tv_sec: (ms / 1000) as libc::time_t,
         tv_nsec: ((ms % 1000) * 1_000_000) as libc::c_long,
     };
-    loop {
-        let mut rem: libc::timespec = unsafe { std::mem::zeroed() };
-        let r = unsafe { libc::nanosleep(&ts, &mut rem) };
-        if r == 0 { break; }
-        // EINTR -- a signal fired
-        let now = INTERVAL_MS.load(Ordering::Relaxed);
-        if now < ms {
-            // Interval decreased (scroll-up / faster): wake immediately
-            break;
-        }
-        // Interval same or increased: sleep the remainder
-        ts = rem;
-    }
+    unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
 }
 
 fn main() {
@@ -801,9 +767,12 @@ fn main() {
     let cores = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) } as u32;
     let mut fds = SysFds::open();
 
-    install_signal(libc::SIGUSR1, sig_faster);
-    install_signal(libc::SIGUSR2, sig_slower);
-    install_signal(libc::SIGRTMIN(), sig_reset);
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = sig_cycle as usize;
+        sa.sa_flags = libc::SA_RESTART;
+        libc::sigaction(libc::SIGRTMIN(), &sa, std::ptr::null_mut());
+    }
 
     let args: Vec<String> = std::env::args().skip(1).collect();
 
