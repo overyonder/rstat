@@ -1,6 +1,6 @@
 # rstat
 
-**A system monitor that runs inside the kernel. Sub-millisecond samples. Faster than `top`.**
+**A system monitor that runs inside the kernel. Single-digit microseconds per switch, sub-millisecond per sample. Faster than `top`.**
 
 <img src="https://over-yonder.tech/assets/rstat-hero.webp" alt="rstat Waybar tooltip showing CPU, memory, IO breakdown, sampled in 2.9ms" width="100%" />
 
@@ -8,7 +8,7 @@ Most system monitors read `/proc` -- opening, reading, and closing thousands of 
 
 `rstat` skips all of that. It injects verified eBPF bytecode into the kernel's scheduler path. When the CPU switches between tasks, the probe reads CPU time, RSS, and IO counters directly from `task_struct` -- no files, no syscalls, no text parsing. Userspace reads the results from a BPF map in a single batch operation.
 
-The result: a complete system health snapshot (CPU%, memory, load, temperature, frequency, GPU, power profile, top-5 processes by CPU/memory/IO with per-process breakdowns) in **under 1 millisecond** on a quiet desktop.
+The result: a complete system health snapshot (CPU%, memory, load, temperature, frequency, GPU, power profile, top-5 processes by CPU/memory/IO with per-process breakdowns) in **under 1 millisecond** per sample, with each in-kernel probe invocation completing in **single-digit microseconds**.
 
 [![Read the full writeup](https://img.shields.io/badge/Read_the_writeup-over--yonder.tech-1a6e2e?style=for-the-badge)](https://over-yonder.tech/#articles/rstat)
 
@@ -19,7 +19,9 @@ The result: a complete system health snapshot (CPU%, memory, load, temperature, 
 - `sched_process_exit` -- marks zombies (Z-state)
 - `sched_process_free` -- cleans up reaped processes
 
-**Userspace daemon (~795 lines of Rust):**
+**Startup /proc scan** seeds any pre-existing D/Z processes into the BPF map so they're visible from the first sample.
+
+**Userspace daemon (~900 lines of Rust):**
 - Custom ELF loader (no aya, no libbpf-rs, no tokio, no C build step)
 - Batch map reads with pre-allocated arrays
 - Hand-written JSON emitter (no serde)
@@ -79,6 +81,14 @@ sudo ./target/release/rstat --bench 200
 ```
 
 Runs 200 sample iterations and prints p50/p95/p99 latencies.
+
+## Profiling BPF overhead
+
+```sh
+sudo rstat --profile 10
+```
+
+Measures per-invocation probe latency over 10 seconds and prints a log2 histogram. The probe self-times using `bpf_ktime_get_ns()` on every context switch.
 
 ## Writeup
 

@@ -51,6 +51,26 @@ struct {
     __type(value, struct sched_in);
 } sched_start SEC(".maps");
 
+// Self-timing histogram: 32 log2(ns) buckets
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 32);
+    __type(key, __u32);
+    __type(value, __u64);
+} latency SEC(".maps");
+
+static __always_inline __u32 log2_u64(__u64 v)
+{
+    __u32 r = 0;
+    if (v > 0xFFFFFFFF) { v >>= 32; r += 32; }
+    if (v > 0xFFFF) { v >>= 16; r += 16; }
+    if (v > 0xFF) { v >>= 8; r += 8; }
+    if (v > 0xF) { v >>= 4; r += 4; }
+    if (v > 0x3) { v >>= 2; r += 2; }
+    if (v > 0x1) { r += 1; }
+    return r;
+}
+
 // sched_switch tracepoint context
 struct sched_switch_args {
     unsigned short common_type;
@@ -150,6 +170,13 @@ int handle_sched_switch(struct sched_switch_args *ctx)
         if (ns && ns->state == 'D')
             ns->state = 0;
     }
+
+    // Self-timing: record probe latency in log2(ns) histogram
+    __u64 _dt = bpf_ktime_get_ns() - now;
+    __u32 _bk = log2_u64(_dt);
+    if (_bk > 31) _bk = 31;
+    __u64 *_bv = bpf_map_lookup_elem(&latency, &_bk);
+    if (_bv) __sync_fetch_and_add(_bv, 1);
 
     return 0;
 }

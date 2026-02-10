@@ -199,6 +199,7 @@ impl PidStats {
 
 const BPF_MAP_CREATE: u32 = 0;
 const BPF_MAP_LOOKUP_ELEM: u32 = 1;
+const BPF_MAP_UPDATE_ELEM: u32 = 2;
 const BPF_MAP_GET_NEXT_KEY: u32 = 4;
 const BPF_PROG_LOAD: u32 = 5;
 const BPF_MAP_LOOKUP_BATCH: u32 = 24;
@@ -244,10 +245,11 @@ struct BpfAttrBatch {
 }
 
 struct BpfLoader {
-    maps: [BpfMapDef; 3],
+    maps: [BpfMapDef; 4],
     prog_fds: Vec<RawFd>,
     perf_fds: Vec<RawFd>,
     stats_fd: RawFd,
+    latency_fd: RawFd,
     use_batch: bool,
     bk: Vec<u32>,
     bv: Vec<BpfPidStats>,
@@ -268,6 +270,12 @@ fn bpf_map_lookup(fd: RawFd, key: &[u8], val: &mut [u8]) -> bool {
     #[repr(C)] struct A { fd: u32, _p: u32, key: u64, val: u64 }
     let a = A { fd: fd as u32, _p: 0, key: key.as_ptr() as u64, val: val.as_mut_ptr() as u64 };
     unsafe { bpf_sys(BPF_MAP_LOOKUP_ELEM, &a as *const _ as *const u8, std::mem::size_of::<A>() as u32) == 0 }
+}
+
+fn bpf_map_update(fd: RawFd, key: &[u8], val: &[u8], flags: u64) -> bool {
+    #[repr(C)] struct A { fd: u32, _p: u32, key: u64, val: u64, flags: u64 }
+    let a = A { fd: fd as u32, _p: 0, key: key.as_ptr() as u64, val: val.as_ptr() as u64, flags };
+    unsafe { bpf_sys(BPF_MAP_UPDATE_ELEM, &a as *const _ as *const u8, std::mem::size_of::<A>() as u32) == 0 }
 }
 
 fn bpf_map_get_next_key(fd: RawFd, key: Option<&[u8]>, next: &mut [u8]) -> bool {
@@ -330,6 +338,8 @@ impl BpfLoader {
                 key_size: 4, value_size: 8, max_entries: 1, fd: -1 },
             BpfMapDef { name: "sched_start", map_type: BPF_MAP_TYPE_HASH,
                 key_size: 4, value_size: 8, max_entries: MAX_PIDS as u32, fd: -1 },
+            BpfMapDef { name: "latency", map_type: BPF_MAP_TYPE_ARRAY,
+                key_size: 4, value_size: 8, max_entries: 32, fd: -1 },
         ];
         for m in &mut maps {
             m.fd = bpf_map_create(m.map_type, m.key_size, m.value_size, m.max_entries)?;
@@ -430,8 +440,9 @@ impl BpfLoader {
             return None;
         }
 
+        let latency_fd = maps[3].fd;
         Some(BpfLoader {
-            maps, prog_fds, perf_fds, stats_fd,
+            maps, prog_fds, perf_fds, stats_fd, latency_fd,
             use_batch: true,
             bk: vec![0u32; MAX_PIDS],
             bv: vec![BpfPidStats::default(); MAX_PIDS],
@@ -760,6 +771,79 @@ fn sleep_or_signal(ms: u64) {
     unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
 }
 
+fn print_histogram(fd: RawFd, secs: f64) {
+    let mut bk = [0u64; 32];
+    for i in 0..32u32 {
+        let kb = i.to_ne_bytes();
+        let mut vb = [0u8; 8];
+        if bpf_map_lookup(fd, &kb, &mut vb) {
+            bk[i as usize] = u64::from_ne_bytes(vb.try_into().unwrap());
+        }
+    }
+    let first = bk.iter().position(|&v| v > 0).unwrap_or(0);
+    let last = bk.iter().rposition(|&v| v > 0).unwrap_or(0);
+    let mx = *bk.iter().max().unwrap_or(&1).max(&1);
+    let total: u64 = bk.iter().sum();
+    let mut sum_ns = 0u64;
+    for (i, &c) in bk.iter().enumerate() {
+        // midpoint of [2^i, 2^(i+1)) ≈ 1.5 * 2^i
+        sum_ns += ((3u64 << i) >> 1) * c;
+    }
+    let avg = if total > 0 { sum_ns / total } else { 0 };
+    let per_sec = total as f64 / secs;
+    let overhead_pct = avg as f64 * per_sec / 1e9 * 100.0;
+    eprintln!("\nrstat BPF probe latency ({total} context switches, {per_sec:.0}/s over {secs:.1}s):\n");
+    eprintln!("    {:>13}    {:>8}  distribution", "ns", "count");
+    for i in first..=last {
+        let lo = 1u64 << i;
+        let hi = (1u64 << (i + 1)) - 1;
+        let c = bk[i];
+        let w = (c * 40 / mx) as usize;
+        let bar = "*".repeat(w);
+        eprintln!("    {lo:>5}-{hi:<8} {c:>8}  |{bar:<40}|");
+    }
+    eprintln!("\n  avg: ~{avg}ns  overhead: {overhead_pct:.4}% of one core ({:.3}ms/s)", avg as f64 * per_sec / 1e6);
+}
+
+/// One-time /proc scan to seed the BPF stats map with pre-existing D/Z processes.
+/// The eBPF probes only see state transitions *after* they attach -- processes that
+/// were already in D or Z state at startup would otherwise be invisible.
+fn seed_existing_dz(stats_fd: RawFd) -> usize {
+    let mut n = 0usize;
+    let Ok(rd) = fs::read_dir("/proc") else { return 0 };
+    let mut buf = [0u8; 512];
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let nb = name.as_encoded_bytes();
+        if nb.is_empty() || nb[0] < b'0' || nb[0] > b'9' { continue; }
+        let pid: u32 = match parse_u64_trim(nb) as u32 { 0 => continue, v => v };
+        let path = format!("/proc/{}/stat", pid);
+        let Some(len) = read_raw(&path, &mut buf) else { continue };
+        let b = &buf[..len];
+        // Format: pid (comm) state ...
+        // Find closing ')' then state is the next non-space char
+        let Some(cp) = b.iter().rposition(|&c| c == b')') else { continue };
+        let rest = &b[cp + 1..];
+        let state = match rest.iter().find(|&&c| c != b' ') {
+            Some(&s) if s == b'D' || s == b'Z' => s,
+            _ => continue,
+        };
+        // Extract comm from between '(' and ')'
+        let op = match b.iter().position(|&c| c == b'(') { Some(i) => i + 1, None => continue };
+        let comm = &b[op..cp];
+        let mut st = BpfPidStats::default();
+        st.state = state;
+        let cl = comm.len().min(16);
+        st.comm[..cl].copy_from_slice(&comm[..cl]);
+        let kb = pid.to_ne_bytes();
+        let vb = unsafe { std::slice::from_raw_parts(&st as *const _ as *const u8, std::mem::size_of::<BpfPidStats>()) };
+        // BPF_NOEXIST (1): don't overwrite if probe already inserted this PID
+        bpf_map_update(stats_fd, &kb, vb, 1);
+        n += 1;
+    }
+    n
+}
+
 fn main() {
     let mut buf = [0u8; 64];
     let me = std::process::id();
@@ -790,9 +874,26 @@ fn main() {
     });
     eprintln!("rstat: eBPF active ({probe_path})");
 
+    let seeded = seed_existing_dz(bpf.stats_fd);
+    if seeded > 0 { eprintln!("rstat: seeded {seeded} pre-existing D/Z processes from /proc"); }
+
+    let profile = args.iter().any(|a| a == "--profile");
+    let profile_secs: u64 = if profile {
+        args.iter().skip_while(|a| *a != "--profile").nth(1)
+            .and_then(|a| a.parse().ok()).unwrap_or(5)
+    } else { 0 };
+
+    if profile {
+        eprintln!("rstat: profiling BPF probe for {profile_secs}s...");
+        thread::sleep(Duration::from_secs(profile_secs));
+        print_histogram(bpf.latency_fd, profile_secs as f64);
+        return;
+    }
+
     let bench = args.iter().any(|a| a == "--bench");
     let bench_n: usize = if bench {
-        args.iter().find_map(|a| a.parse::<usize>().ok()).unwrap_or(100)
+        args.iter().skip_while(|a| *a != "--bench").nth(1)
+            .and_then(|a| a.parse().ok()).unwrap_or(100)
     } else { 0 };
 
     // Pre-allocated, reused every tick (zero-alloc steady state)
