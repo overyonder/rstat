@@ -1,12 +1,13 @@
 use std::fmt::Write as FmtWrite;
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{fs, thread};
 use std::time::{Duration, Instant};
 
 const INTERVALS: [u64; 6] = [2000, 1000, 500, 250, 100, 2000];
 static INTERVAL_MS: AtomicU64 = AtomicU64::new(2000);
+static SHOW_KTHREADS: AtomicBool = AtomicBool::new(false);
 const PAGE_SIZE: u64 = 4096;
 const GPU_DIR: &str = "/sys/class/drm/card1/gt/gt0";
 const TOP_N: usize = 5;
@@ -534,7 +535,9 @@ struct Sample {
     top_cpu: Top5,
     top_mem: Top5,
     top_io: IoTop5,
+    top_kthread: Top5,
     blocked: StateList,
+    show_kthreads: bool,
     ts: Instant,
 }
 
@@ -587,9 +590,11 @@ fn take_sample(
     profile[..pl].copy_from_slice(&buf[..pl]);
 
     let total_ns = (elapsed_s * 1_000_000_000.0 * cores as f64) as u64;
+    let show_kt = SHOW_KTHREADS.load(Ordering::Relaxed);
     let mut top_cpu = Top5::new();
     let mut top_mem = Top5::new();
     let mut top_io = IoTop5::new();
+    let mut top_kthread = Top5::new();
     let mut blocked = StateList::new();
     let min_io = if elapsed_s > 0.0 { (MIN_IO_BYTES as f64 * elapsed_s) as u64 } else { u64::MAX };
     let mut busy_ns = 0u64;
@@ -606,6 +611,17 @@ fn take_sample(
         let prev_cpu = prev_st.map(|p| p.cpu_ns).unwrap_or(0);
         let dcpu = st.cpu_ns.saturating_sub(prev_cpu);
         busy_ns += dcpu;
+
+        // Kernel threads have no mm, so rss_pages == 0
+        let is_kthread = st.rss_pages == 0;
+
+        if is_kthread {
+            if show_kt && total_ns > 0 && dcpu > 0 {
+                top_kthread.insert(dcpu, &st.comm[..cl]);
+            }
+            continue;
+        }
+
         if total_ns > 0 && dcpu > 0 {
             let thr_ns = (MIN_CPU_PCT * total_ns as f64 / 100.0) as u64;
             if dcpu >= thr_ns { top_cpu.insert(dcpu, &st.comm[..cl]); }
@@ -630,7 +646,8 @@ fn take_sample(
         gpu_rc6_ms: rc6, gpu_freq: gf, gpu_max: gm,
         cpu_temp: ct, cpu_freq: cf, cpu_fmax: cfm,
         throttle: thr, profile, profile_len: pl as u8,
-        top_cpu, top_mem, top_io, blocked, ts: Instant::now(),
+        top_cpu, top_mem, top_io, top_kthread, blocked,
+        show_kthreads: show_kt, ts: Instant::now(),
     }
 }
 
@@ -733,6 +750,20 @@ fn emit(prev: Option<&Sample>, cur: &mut Sample, dur: Duration, tt: &mut String,
             let _ = write!(tt, "\n{t:5.1}M/s  {} (R:{r:.1} W:{w:.1})", comm_str(&e.comm, e.cl));
         }
     }
+    if cur.show_kthreads {
+        tt.push_str("\n\n Kernel");
+        let entries = cur.top_kthread.sorted();
+        if entries.is_empty() {
+            tt.push_str("\n  ---");
+        } else {
+            let total_ns = elapsed_s * cur.cores as f64 * 1_000_000_000.0;
+            for e in entries {
+                let pct = if total_ns > 0.0 { e.val as f64 * 100.0 / total_ns } else { 0.0 };
+                let _ = write!(tt, "\n{pct:5.1}%  {}", comm_str(&e.comm, e.cl));
+            }
+        }
+    }
+
     let ival = INTERVAL_MS.load(Ordering::Relaxed);
     let _ = write!(tt, "\n\nSampled in {:.1}ms (every {ival}ms)", dur.as_secs_f64() * 1000.0);
 
@@ -761,6 +792,10 @@ extern "C" fn sig_cycle(_: libc::c_int) {
     let cur = INTERVAL_MS.load(Ordering::Relaxed);
     let next = INTERVALS.iter().skip_while(|&&v| v != cur).nth(1).copied().unwrap_or(INTERVALS[0]);
     INTERVAL_MS.store(next, Ordering::Relaxed);
+}
+
+extern "C" fn sig_kthreads(_: libc::c_int) {
+    SHOW_KTHREADS.fetch_xor(true, Ordering::Relaxed);
 }
 
 fn sleep_or_signal(ms: u64) {
@@ -853,9 +888,11 @@ fn main() {
 
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = sig_cycle as usize;
         sa.sa_flags = libc::SA_RESTART;
+        sa.sa_sigaction = sig_cycle as usize;
         libc::sigaction(libc::SIGRTMIN(), &sa, std::ptr::null_mut());
+        sa.sa_sigaction = sig_kthreads as usize;
+        libc::sigaction(libc::SIGRTMIN() + 1, &sa, std::ptr::null_mut());
     }
 
     let args: Vec<String> = std::env::args().skip(1).collect();

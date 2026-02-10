@@ -1,6 +1,6 @@
 # rstat
 
-**A system monitor that runs inside the kernel. Single-digit microseconds per switch, sub-millisecond per sample. Faster than `top`.**
+**A system monitor that runs inside the kernel. Single-digit microseconds per switch, sub-millisecond per sample. More data than `top`, `iotop`, and `ps` combined.**
 
 <img src="https://over-yonder.tech/assets/rstat-hero.webp" alt="rstat Waybar tooltip showing CPU, memory, IO breakdown, sampled in 2.9ms" width="100%" />
 
@@ -31,7 +31,7 @@ The result: a complete system health snapshot (CPU%, memory, load, temperature, 
 
 | Stage | Time | Approach |
 |-------|------|----------|
-| Bash + coreutils | ~2,000 ms | Fork 10-15 subprocesses per sample |
+| Bash + coreutils | ~800 ms | Fork 8-12 subprocesses per sample |
 | Rust + /proc | ~700 ms | Direct /proc parsing, one subprocess remained |
 | Optimised /proc | ~15 ms | Sysfs, reusable buffers, byte-level parsing |
 | **eBPF** | **<1 ms** | BPF probes, batch map reads, hand-written JSON |
@@ -61,17 +61,23 @@ The binary requires `CAP_SYS_ADMIN` (or equivalent, e.g. NixOS `security.wrapper
     "exec": "rstat",
     "return-type": "json",
     "restart-interval": 0,
-    "on-click": "kill -RTMIN $(pgrep rstat)"
+    "on-click": "kill -RTMIN $(pgrep rstat)",
+    "on-click-middle": "kill -RTMIN+1 $(pgrep rstat)"
 }
 ```
 
-## Interval control
+## Controls
 
-Left-click cycles the update interval: 2000ms → 1000 → 500 → 250 → 100 → 2000ms.
-The current interval is shown in the tooltip.
+**Left-click** cycles the update interval: 2000ms → 1000 → 500 → 250 → 100 → 2000ms.
 
 ```sh
 kill -RTMIN $(pgrep rstat)
+```
+
+**Middle-click** toggles kernel thread visibility. When enabled, a "Kernel" section appears in the tooltip showing the top-5 kernel threads by CPU (kworkers, ksoftirqd, migration threads, etc.).
+
+```sh
+kill -RTMIN+1 $(pgrep rstat)
 ```
 
 ## Benchmarking
@@ -92,6 +98,6 @@ Measures per-invocation probe latency over 10 seconds and prints a log2 histogra
 
 ## Writeup
 
-The full story of how this went from a 2-second shell script to sub-millisecond eBPF:
+The full story of how this went from an 800ms shell script to sub-millisecond eBPF:
 
 [![Read the writeup on over-yonder.tech](https://img.shields.io/badge/Read_the_writeup-over--yonder.tech-1a6e2e?style=for-the-badge)](https://over-yonder.tech/#articles/rstat)
