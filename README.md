@@ -1,27 +1,45 @@
 # rstat
 
-**A system monitor that runs inside the kernel. Single-digit microseconds per switch, sub-millisecond per sample. More data than `top`, `iotop`, and `ps` combined.**
+**A system monitor that runs inside the kernel. Single-digit microseconds per
+switch, sub-millisecond per sample. More data than `top`, `iotop`, and `ps`
+combined.**
 
 <img src="https://over-yonder.tech/assets/rstat-hero.webp" alt="rstat Waybar tooltip showing CPU, memory, IO breakdown, sampled in 2.9ms" width="100%" />
 
-Most system monitors read `/proc` -- opening, reading, and closing thousands of files every refresh cycle. `top` does it. `btop` does it. They parse ASCII text the kernel formatted from data structures it already had in memory. It is a serialisation round-trip through the filesystem for numbers the kernel could hand you directly.
+Most system monitors read `/proc` -- opening, reading, and closing thousands of
+files every refresh cycle. `top` does it. `btop` does it. They parse ASCII text
+the kernel formatted from data structures it already had in memory. It is a
+serialisation round-trip through the filesystem for numbers the kernel could
+hand you directly.
 
-`rstat` skips all of that. It injects verified eBPF bytecode into the kernel's scheduler path. When the CPU switches between tasks, the probe reads CPU time, RSS, and IO counters directly from `task_struct` -- no files, no syscalls, no text parsing. Userspace reads the results from a BPF map in a single batch operation.
+`rstat` skips all of that. It injects verified eBPF bytecode into the kernel's
+scheduler path. When the CPU switches between tasks, the probe reads CPU time,
+RSS, and IO counters directly from `task_struct` -- no files, no syscalls, no
+text parsing. Userspace reads the results from a BPF map in a single batch
+operation.
 
-The result: a complete system health snapshot (CPU%, memory, load, temperature, frequency, GPU, power profile, top-5 processes by CPU/memory/IO with per-process breakdowns) in **under 1 millisecond** per sample, with each in-kernel probe invocation completing in **single-digit microseconds**.
+The result: a complete system health snapshot (CPU%, memory, load, temperature,
+frequency, GPU, power profile, top-5 processes by CPU/memory/IO with per-process
+breakdowns) in **under 1 millisecond** per sample, with each in-kernel probe
+invocation completing in **single-digit microseconds**.
 
 [![Read the full writeup](https://img.shields.io/badge/Read_the_writeup-over--yonder.tech-1a6e2e?style=for-the-badge)](https://over-yonder.tech/#articles/rstat)
 
 ## How it works
 
 **Three BPF tracepoint probes:**
-- `sched_switch` -- accounts CPU time, snapshots RSS and IO for the outgoing task
-- `sched_process_exit` -- marks zombies (Z-state), clears seen flag for client handshake
+
+- `sched_switch` -- accounts CPU time, snapshots RSS and IO for the outgoing
+  task
+- `sched_process_exit` -- marks zombies (Z-state), clears seen flag for client
+  handshake
 - `sched_process_free` -- cleans up reaped processes
 
-**Startup /proc scan** seeds any pre-existing D/Z processes into the BPF map so they're visible from the first sample.
+**Startup /proc scan** seeds any pre-existing D/Z processes into the BPF map so
+they're visible from the first sample.
 
 **Userspace daemon (~900 lines of Rust):**
+
 - Custom ELF loader (no aya, no libbpf-rs, no tokio, no C build step)
 - Batch map reads with pre-allocated arrays
 - Hand-written JSON emitter (no serde)
@@ -29,12 +47,12 @@ The result: a complete system health snapshot (CPU%, memory, load, temperature, 
 
 ## Performance
 
-| Stage | Time | Approach |
-|-------|------|----------|
-| Bash + coreutils | ~800 ms | Fork 8-12 subprocesses per sample |
-| Rust + /proc | ~700 ms | Direct /proc parsing, one subprocess remained |
-| Optimised /proc | ~15 ms | Sysfs, reusable buffers, byte-level parsing |
-| **eBPF** | **<1 ms** | BPF probes, batch map reads, hand-written JSON |
+| Stage            | Time      | Approach                                       |
+| ---------------- | --------- | ---------------------------------------------- |
+| Bash + coreutils | ~800 ms   | Fork 8-12 subprocesses per sample              |
+| Rust + /proc     | ~700 ms   | Direct /proc parsing, one subprocess remained  |
+| Optimised /proc  | ~15 ms    | Sysfs, reusable buffers, byte-level parsing    |
+| **eBPF**         | **<1 ms** | BPF probes, batch map reads, hand-written JSON |
 
 ~200 KB RSS. <0.01% CPU. Two runtime dependencies (`libc`, `goblin`).
 
@@ -49,10 +67,12 @@ nix build
 ```
 
 Two-derivation build:
+
 1. `rstat-probe` -- compiles `probe.bpf.c` with `clang -target bpf -O2 -g`
 2. `rstat` -- builds the Rust binary, copies the probe alongside it
 
-The binary requires `CAP_SYS_ADMIN` (or equivalent, e.g. NixOS `security.wrappers`) for `bpf()` and `perf_event_open()`.
+The binary requires `CAP_SYS_ADMIN` (or equivalent, e.g. NixOS
+`security.wrappers`) for `bpf()` and `perf_event_open()`.
 
 ## Waybar integration
 
@@ -68,13 +88,16 @@ The binary requires `CAP_SYS_ADMIN` (or equivalent, e.g. NixOS `security.wrapper
 
 ## Controls
 
-**Left-click** cycles the update interval: 2000ms → 1000 → 500 → 250 → 100 → 2000ms.
+**Left-click** cycles the update interval: 2000ms → 1000 → 250 → 100 → 25 →
+2000ms.
 
 ```sh
 kill -RTMIN $(pgrep rstat)
 ```
 
-**Middle-click** toggles kernel thread visibility. When enabled, a "Kernel" section appears in the tooltip showing the top-5 kernel threads by CPU (kworkers, ksoftirqd, migration threads, etc.).
+**Middle-click** toggles kernel thread visibility. When enabled, a "Kernel"
+section appears in the tooltip showing the top-5 kernel threads by CPU
+(kworkers, ksoftirqd, migration threads, etc.).
 
 ```sh
 kill -RTMIN+1 $(pgrep rstat)
@@ -94,10 +117,13 @@ Runs 200 sample iterations and prints p50/p95/p99 latencies.
 sudo rstat --profile 10
 ```
 
-Measures per-invocation probe latency over 10 seconds and prints a log2 histogram. The probe self-times using `bpf_ktime_get_ns()` on every context switch.
+Measures per-invocation probe latency over 10 seconds and prints a log2
+histogram. The probe self-times using `bpf_ktime_get_ns()` on every context
+switch.
 
 ## Writeup
 
-The full story of how this went from an 800ms shell script to sub-millisecond eBPF:
+The full story of how this went from an 800ms shell script to sub-millisecond
+eBPF:
 
 [![Read the writeup on over-yonder.tech](https://img.shields.io/badge/Read_the_writeup-over--yonder.tech-1a6e2e?style=for-the-badge)](https://over-yonder.tech/#articles/rstat)
