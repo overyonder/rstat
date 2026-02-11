@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
-const INTERVALS: [u64; 6] = [2000, 1000, 250, 100, 25, 2000];
+const INTERVALS: [u64; 6] = [2000, 1000, 500, 250, 100, 2000];
 static INTERVAL_MS: AtomicU64 = AtomicU64::new(2000);
 static SHOW_KTHREADS: AtomicBool = AtomicBool::new(false);
 const PAGE_SIZE: u64 = 4096;
@@ -1435,6 +1435,10 @@ fn main() {
         thread::sleep(Duration::from_secs(profile_secs));
         print_histogram(bpf.latency_fd, profile_secs as f64);
         return;
+    }
+
+    if args.iter().any(|a| a == "--ludicrous") {
+        INTERVAL_MS.store(16, Ordering::Relaxed);
     }
 
     let bench = args.iter().any(|a| a == "--bench");

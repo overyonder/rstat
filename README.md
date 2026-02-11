@@ -88,11 +88,19 @@ The binary requires `CAP_SYS_ADMIN` (or equivalent, e.g. NixOS
 
 ## Controls
 
-**Left-click** cycles the update interval: 2000ms → 1000 → 250 → 100 → 25 →
-2000ms.
+**Left-click** cycles the update interval: 2000ms → 1000 → 500 → 250 → 100 →
+2000ms. The 100ms floor is the fastest Waybar can reliably render with GTK --
+below that, pipe backpressure throttles output regardless of sample speed.
 
 ```sh
 kill -RTMIN $(pgrep rstat)
+```
+
+**`--ludicrous`** bypasses the Waybar limit for terminal use. Sets the sample
+interval to 16ms (~60 fps). Pipe to a terminal or TUI that can keep up:
+
+```sh
+sudo rstat --ludicrous
 ```
 
 **Middle-click** toggles kernel thread visibility. When enabled, a "Kernel"
