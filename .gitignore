@@ -2,3 +2,4 @@
 /result
 perf.data*
 *.bpf.o
+src/vmlinux.h

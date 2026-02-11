@@ -14,6 +14,19 @@
   in {
     packages = forAllSystems (system: let
       pkgs = nixpkgs.legacyPackages.${system};
+      vmlinux-h = pkgs.stdenv.mkDerivation {
+        pname = "vmlinux-h";
+        version = pkgs.linuxPackages.kernel.version;
+        dontUnpack = true;
+        nativeBuildInputs = [pkgs.bpftools];
+        buildPhase = ''
+          bpftool btf dump file ${pkgs.linuxPackages.kernel.dev}/vmlinux format c > vmlinux.h
+        '';
+        installPhase = ''
+          mkdir -p $out
+          cp vmlinux.h $out/
+        '';
+      };
       probe = pkgs.stdenv.mkDerivation {
         pname = "rstat-probe";
         version = "0.1.0";
@@ -26,6 +39,7 @@
           ${pkgs.llvmPackages.clang-unwrapped}/bin/clang \
             -target bpf -O2 -g \
             -I${pkgs.libbpf}/include \
+            -I${vmlinux-h} \
             -I$src \
             -c $src/probe.bpf.c -o probe.bpf.o
         '';
