@@ -16,7 +16,7 @@ The result: a complete system health snapshot (CPU%, memory, load, temperature, 
 
 **Three BPF tracepoint probes:**
 - `sched_switch` -- accounts CPU time, snapshots RSS and IO for the outgoing task
-- `sched_process_exit` -- marks zombies (Z-state)
+- `sched_process_exit` -- marks zombies (Z-state), clears seen flag for client handshake
 - `sched_process_free` -- cleans up reaped processes
 
 **Startup /proc scan** seeds any pre-existing D/Z processes into the BPF map so they're visible from the first sample.

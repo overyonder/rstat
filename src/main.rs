@@ -235,6 +235,7 @@ struct BpfPidStats {
     io_wb: u64,
     comm: [u8; 16],
     state: u8,
+    seen: u8, // client sets on first observation; probe clears on exit/free
 }
 
 #[repr(C)]
@@ -492,6 +493,21 @@ impl BpfLoader {
         true
     }
 
+    // Mark unseen zombies as seen. Only zombies still present with seen=1
+    // on the next poll are displayed (they survived a full interval).
+    fn ack_zombies(&self, stats: &PidStats) {
+        for &(pid, ref st) in &stats.entries {
+            if st.state == b'Z' && st.seen == 0 {
+                let mut ack = *st;
+                ack.seen = 1;
+                let kb = pid.to_ne_bytes();
+                let vb = unsafe { std::slice::from_raw_parts(
+                    &ack as *const _ as *const u8, std::mem::size_of::<BpfPidStats>()) };
+                bpf_map_update(self.stats_fd, &kb, vb, 2); // BPF_EXIST
+            }
+        }
+    }
+
     fn read_iter(&self, out: &mut PidStats) {
         let mut key = [0u8; 4];
         let mut pk: Option<[u8; 4]> = None;
@@ -603,7 +619,7 @@ fn take_sample(
         if pid == me || pid == parent || pid == 0 { continue; }
         let cl = st.comm.iter().position(|&b| b == 0).unwrap_or(16);
         if cl == 0 { continue; }
-        if st.state == b'D' || st.state == b'Z' {
+        if st.state == b'D' || (st.state == b'Z' && st.seen != 0) {
             blocked.push(st.state, &st.comm[..cl]);
         }
 
@@ -868,6 +884,7 @@ fn seed_existing_dz(stats_fd: RawFd) -> usize {
         let comm = &b[op..cp];
         let mut st = BpfPidStats::default();
         st.state = state;
+        if state == b'Z' { st.seen = 1; } // pre-existing zombie: display immediately
         let cl = comm.len().min(16);
         st.comm[..cl].copy_from_slice(&comm[..cl]);
         let kb = pid.to_ne_bytes();
@@ -981,6 +998,7 @@ fn main() {
         let t0 = Instant::now();
         let es = t0.duration_since(prev_sample.ts).as_secs_f64();
         bpf.read_stats(&mut cur);
+        bpf.ack_zombies(&cur);
         let mut s = take_sample(me, parent, &mut buf, &mut fds, cores, es, &cur, &prev);
         let dur = t0.elapsed();
         emit(Some(&prev_sample), &mut s, dur, &mut tt, &mut json, &mut text_buf);

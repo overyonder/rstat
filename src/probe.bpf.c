@@ -16,6 +16,7 @@ struct pid_stats {
     __u64 io_wb;        // cumulative write_bytes from task->ioac
     char  comm[TASK_COMM_LEN];
     __u8  state;        // 'D' = uninterruptible, 'Z' = zombie, 0 = normal
+    __u8  seen;         // client sets on first observation; cleared on exit/free
 };
 
 // System-wide counters
@@ -198,8 +199,10 @@ int handle_sched_exit(struct sched_process_exit_args *ctx)
     __u32 pid = ctx->pid;
     bpf_map_delete_elem(&sched_start, &pid);
     struct pid_stats *s = bpf_map_lookup_elem(&stats, &pid);
-    if (s)
+    if (s) {
         s->state = 'Z';
+        s->seen = 0;
+    }
     return 0;
 }
 
