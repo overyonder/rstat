@@ -14,9 +14,11 @@ struct pid_stats {
     __u64 rss_pages;    // latest RSS snapshot (file+anon+shm pages)
     __u64 io_rb;        // cumulative read_bytes from task->ioac
     __u64 io_wb;        // cumulative write_bytes from task->ioac
+    __u32 tgid;         // thread-group id (process id)
     char  comm[TASK_COMM_LEN];
     __u8  state;        // 'D' = uninterruptible, 'Z' = zombie, 0 = normal
     __u8  seen;         // client sets on first observation; cleared on exit/free
+    __u16 _pad;
 };
 
 // System-wide counters
@@ -100,6 +102,11 @@ static __always_inline void read_tp_comm(char *dst, const char *src)
 static __always_inline void snapshot_task(struct pid_stats *s)
 {
     struct task_struct *task = (void *)bpf_get_current_task();
+
+    // Process identity (aggregate per-process in userspace)
+    __u32 tgid = 0;
+    bpf_probe_read_kernel(&tgid, sizeof(tgid), &task->tgid);
+    s->tgid = tgid;
 
     // RSS: mm->rss_stat[0..3].count (percpu_counter approx value)
     // indices: 0=file, 1=anon, 2=swap, 3=shmem; RSS = file+anon+shmem

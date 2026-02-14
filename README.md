@@ -35,6 +35,12 @@ invocation completing in **single-digit microseconds**.
   handshake
 - `sched_process_free` -- cleans up reaped processes
 
+Runtime guarantees:
+
+- Strict probe health checks at startup (required tracepoints must attach)
+- Single-instance lock to avoid partial/competing probe attachments
+- Per-thread kernel data aggregated to per-process rows in userspace (by TGID)
+
 **Startup /proc scan** seeds any pre-existing D/Z processes into the BPF map so
 they're visible from the first sample.
 

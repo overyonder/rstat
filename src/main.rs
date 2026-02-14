@@ -1,6 +1,7 @@
 use std::fmt::Write as FmtWrite;
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, RawFd};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
@@ -8,6 +9,7 @@ use std::{fs, thread};
 const INTERVALS: [u64; 6] = [2000, 1000, 500, 250, 100, 2000];
 static INTERVAL_MS: AtomicU64 = AtomicU64::new(2000);
 static SHOW_KTHREADS: AtomicBool = AtomicBool::new(false);
+static MAP_CAP_WARNED: AtomicBool = AtomicBool::new(false);
 const PAGE_SIZE: u64 = 4096;
 const GPU_DIR: &str = "/sys/class/drm/card1/gt/gt0";
 const TOP_N: usize = 5;
@@ -330,6 +332,9 @@ impl PidStats {
             .ok()
             .map(|i| &self.entries[i].1)
     }
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 // --- eBPF loader ---
@@ -377,9 +382,11 @@ struct BpfPidStats {
     rss_pages: u64,
     io_rb: u64,
     io_wb: u64,
+    tgid: u32,
     comm: [u8; 16],
     state: u8,
     seen: u8, // client sets on first observation; probe clears on exit/free
+    _pad: u16,
 }
 
 #[repr(C)]
@@ -622,7 +629,25 @@ impl BpfLoader {
                 .unwrap_or(false)
         });
 
-        let mut sym_to_fd = std::collections::HashMap::new();
+        fn close_all(maps: &[BpfMapDef; 4], prog_fds: &[RawFd], perf_fds: &[RawFd]) {
+            for m in maps {
+                unsafe {
+                    libc::close(m.fd);
+                }
+            }
+            for f in prog_fds {
+                unsafe {
+                    libc::close(*f);
+                }
+            }
+            for f in perf_fds {
+                unsafe {
+                    libc::close(*f);
+                }
+            }
+        }
+
+        let mut sym_to_fd = HashMap::new();
         if let Some(mi) = maps_shndx {
             for (si, sym) in elf.syms.iter().enumerate() {
                 if sym.st_shndx == mi {
@@ -657,6 +682,26 @@ impl BpfLoader {
                 }
             })
             .collect();
+
+        const REQUIRED_SECTIONS: [&str; 3] = [
+            "tracepoint/sched/sched_switch",
+            "tracepoint/sched/sched_process_exit",
+            "tracepoint/sched/sched_process_free",
+        ];
+        for req in REQUIRED_SECTIONS {
+            if !prog_sections.iter().any(|(_, n)| n == req) {
+                eprintln!("bpf: required program section missing: {req}");
+                close_all(&maps, &prog_fds, &perf_fds);
+                return None;
+            }
+        }
+
+        let ncpu = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) } as i32;
+        if ncpu <= 0 {
+            eprintln!("bpf: invalid CPU count: {ncpu}");
+            close_all(&maps, &prog_fds, &perf_fds);
+            return None;
+        }
 
         for (shndx, sec_name) in &prog_sections {
             let sh = &elf.section_headers[*shndx];
@@ -703,21 +748,7 @@ impl BpfLoader {
                             io::Error::last_os_error()
                         );
                     }
-                    for m in &maps {
-                        unsafe {
-                            libc::close(m.fd);
-                        }
-                    }
-                    for f in &prog_fds {
-                        unsafe {
-                            libc::close(*f);
-                        }
-                    }
-                    for f in &perf_fds {
-                        unsafe {
-                            libc::close(*f);
-                        }
-                    }
+                    close_all(&maps, &prog_fds, &perf_fds);
                     return None;
                 }
             };
@@ -725,44 +756,68 @@ impl BpfLoader {
 
             let parts = sec_name.splitn(3, '/').collect::<Vec<&str>>();
             if parts.len() != 3 {
-                continue;
+                eprintln!("bpf: invalid section name format: {sec_name}");
+                close_all(&maps, &prog_fds, &perf_fds);
+                return None;
             }
             let (cat, tp) = (parts[1], parts[2]);
             let tp_id = match tracepoint_id(cat, tp) {
                 Some(id) => id,
                 None => {
                     eprintln!("bpf: tracepoint {cat}/{tp} not found");
-                    continue;
+                    close_all(&maps, &prog_fds, &perf_fds);
+                    return None;
                 }
             };
 
-            let ncpu = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) } as i32;
+            let mut sec_perf = Vec::with_capacity(ncpu as usize);
             for cpu in 0..ncpu {
                 let Some(pfd) = perf_event_open_tracepoint(tp_id, cpu) else {
-                    continue;
+                    eprintln!("bpf: perf_event_open failed for {sec_name} cpu {cpu}");
+                    close_all(&maps, &prog_fds, &perf_fds);
+                    return None;
                 };
-                let r = unsafe { libc::ioctl(pfd, PERF_EVENT_IOC_SET_BPF as libc::c_ulong, fd) };
-                if r < 0 {
+                sec_perf.push(pfd);
+            }
+
+            if sec_perf.is_empty() {
+                eprintln!("bpf: no perf fds opened for {sec_name}");
+                close_all(&maps, &prog_fds, &perf_fds);
+                return None;
+            }
+
+            let set_r = unsafe {
+                libc::ioctl(
+                    sec_perf[0],
+                    PERF_EVENT_IOC_SET_BPF as libc::c_ulong,
+                    fd,
+                )
+            };
+            if set_r < 0 {
+                eprintln!(
+                    "bpf: attach failed for {sec_name}: {}",
+                    io::Error::last_os_error()
+                );
+                close_all(&maps, &prog_fds, &perf_fds);
+                return None;
+            }
+
+            for (cpu, pfd) in sec_perf.iter().enumerate() {
+                let er = unsafe { libc::ioctl(*pfd, PERF_EVENT_IOC_ENABLE as libc::c_ulong, 0) };
+                if er < 0 {
                     eprintln!(
-                        "bpf: attach failed for {sec_name} cpu {cpu}: {}",
+                        "bpf: enable failed for {sec_name} cpu {cpu}: {}",
                         io::Error::last_os_error()
                     );
-                    unsafe {
-                        libc::close(pfd);
-                    }
-                    continue;
+                    close_all(&maps, &prog_fds, &perf_fds);
+                    return None;
                 }
-                unsafe { libc::ioctl(pfd, PERF_EVENT_IOC_ENABLE as libc::c_ulong, 0) };
-                perf_fds.push(pfd);
             }
+            perf_fds.extend(sec_perf);
         }
 
         if prog_fds.is_empty() {
-            for m in &maps {
-                unsafe {
-                    libc::close(m.fd);
-                }
-            }
+            close_all(&maps, &prog_fds, &perf_fds);
             return None;
         }
 
@@ -784,6 +839,9 @@ impl BpfLoader {
         if self.use_batch {
             if self.read_batch(out) {
                 out.sort();
+                if out.len() >= MAX_PIDS && !MAP_CAP_WARNED.swap(true, Ordering::Relaxed) {
+                    eprintln!("rstat: stats map reached MAX_PIDS ({MAX_PIDS}); results may be truncated");
+                }
                 return;
             }
             self.use_batch = false;
@@ -791,6 +849,9 @@ impl BpfLoader {
         }
         self.read_iter(out);
         out.sort();
+        if out.len() >= MAX_PIDS && !MAP_CAP_WARNED.swap(true, Ordering::Relaxed) {
+            eprintln!("rstat: stats map reached MAX_PIDS ({MAX_PIDS}); results may be truncated");
+        }
     }
 
     fn read_batch(&mut self, out: &mut PidStats) -> bool {
@@ -940,6 +1001,45 @@ fn sample_throttle(files: &mut [ThrottleFile], buf: &mut [u8]) -> ([u8; 64], usi
     (out, pos)
 }
 
+#[derive(Clone, Copy)]
+struct ProcAgg {
+    cpu_ns: u64,
+    rss_bytes: u64,
+    io_dr: u64,
+    io_dw: u64,
+    has_d: bool,
+    has_z: bool,
+    comm: [u8; COMM_LEN],
+    cl: u8,
+}
+
+impl ProcAgg {
+    fn new() -> Self {
+        Self {
+            cpu_ns: 0,
+            rss_bytes: 0,
+            io_dr: 0,
+            io_dw: 0,
+            has_d: false,
+            has_z: false,
+            comm: [0; COMM_LEN],
+            cl: 0,
+        }
+    }
+
+    fn set_comm(&mut self, comm: &[u8]) {
+        if self.cl != 0 {
+            return;
+        }
+        let l = comm.len().min(COMM_LEN);
+        if l == 0 {
+            return;
+        }
+        self.comm[..l].copy_from_slice(&comm[..l]);
+        self.cl = l as u8;
+    }
+}
+
 fn take_sample(
     me: u32,
     parent: u32,
@@ -983,6 +1083,7 @@ fn take_sample(
     let mut top_io = IoTop5::new();
     let mut top_kthread = Top5::new();
     let mut blocked = StateList::new();
+    let mut procs: HashMap<u32, ProcAgg> = HashMap::new();
     let min_io = if elapsed_s > 0.0 {
         (MIN_IO_BYTES as f64 * elapsed_s) as u64
     } else {
@@ -999,7 +1100,9 @@ fn take_sample(
             continue;
         }
         if st.state == b'D' || (st.state == b'Z' && st.seen != 0) {
-            blocked.push(st.state, &st.comm[..cl]);
+            if st.rss_pages == 0 {
+                blocked.push(st.state, &st.comm[..cl]);
+            }
         }
 
         let prev_st = prev.get(pid);
@@ -1016,25 +1119,45 @@ fn take_sample(
             }
             continue;
         }
-
-        if total_ns > 0 && dcpu > 0 {
-            let thr_ns = (MIN_CPU_PCT * total_ns as f64 / 100.0) as u64;
-            if dcpu >= thr_ns {
-                top_cpu.insert(dcpu, &st.comm[..cl]);
-            }
-        }
-
-        let rss = st.rss_pages * PAGE_SIZE;
-        if rss >= MIN_MEM_BYTES {
-            top_mem.insert(rss, &st.comm[..cl]);
-        }
-
         let (prb, pwb) = prev_st.map(|p| (p.io_rb, p.io_wb)).unwrap_or((0, 0));
         let drb = st.io_rb.saturating_sub(prb);
         let dwb = st.io_wb.saturating_sub(pwb);
-        let dt = drb + dwb;
+
+        let tgid = if st.tgid != 0 { st.tgid } else { pid };
+        let e = procs.entry(tgid).or_insert_with(ProcAgg::new);
+        e.cpu_ns = e.cpu_ns.saturating_add(dcpu);
+        e.rss_bytes = e.rss_bytes.max(st.rss_pages.saturating_mul(PAGE_SIZE));
+        e.io_dr = e.io_dr.saturating_add(drb);
+        e.io_dw = e.io_dw.saturating_add(dwb);
+        e.has_d |= st.state == b'D';
+        e.has_z |= st.state == b'Z' && st.seen != 0;
+        e.set_comm(&st.comm[..cl]);
+    }
+
+    for e in procs.values() {
+        if e.cl == 0 {
+            continue;
+        }
+        if e.has_d {
+            blocked.push(b'D', &e.comm[..e.cl as usize]);
+        } else if e.has_z {
+            blocked.push(b'Z', &e.comm[..e.cl as usize]);
+        }
+
+        if total_ns > 0 && e.cpu_ns > 0 {
+            let thr_ns = (MIN_CPU_PCT * total_ns as f64 / 100.0) as u64;
+            if e.cpu_ns >= thr_ns {
+                top_cpu.insert(e.cpu_ns, &e.comm[..e.cl as usize]);
+            }
+        }
+
+        if e.rss_bytes >= MIN_MEM_BYTES {
+            top_mem.insert(e.rss_bytes, &e.comm[..e.cl as usize]);
+        }
+
+        let dt = e.io_dr.saturating_add(e.io_dw);
         if dt >= min_io {
-            top_io.insert(dt, drb, dwb, &st.comm[..cl]);
+            top_io.insert(dt, e.io_dr, e.io_dw, &e.comm[..e.cl as usize]);
         }
     }
 
@@ -1358,6 +1481,7 @@ fn seed_existing_dz(stats_fd: RawFd) -> usize {
         let comm = &b[op..cp];
         let mut st = BpfPidStats::default();
         st.state = state;
+        st.tgid = pid;
         if state == b'Z' {
             st.seen = 1;
         } // pre-existing zombie: display immediately
@@ -1371,10 +1495,44 @@ fn seed_existing_dz(stats_fd: RawFd) -> usize {
             )
         };
         // BPF_NOEXIST (1): don't overwrite if probe already inserted this PID
-        bpf_map_update(stats_fd, &kb, vb, 1);
-        n += 1;
+        if bpf_map_update(stats_fd, &kb, vb, 1) {
+            n += 1;
+        }
     }
     n
+}
+
+struct InstanceLock {
+    _file: fs::File,
+}
+
+fn acquire_instance_lock() -> Option<InstanceLock> {
+    let uid = unsafe { libc::geteuid() };
+    let p = format!("/run/user/{uid}/rstat.lock");
+    let f = match fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&p)
+    {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("rstat: failed to open lockfile {p}: {e}");
+            return None;
+        }
+    };
+    let r = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if r != 0 {
+        let e = io::Error::last_os_error();
+        let oe = e.raw_os_error();
+        if oe == Some(libc::EWOULDBLOCK) || oe == Some(libc::EAGAIN) {
+            eprintln!("rstat: another instance is already running");
+        } else {
+            eprintln!("rstat: failed to acquire lock {p}: {e}");
+        }
+        return None;
+    }
+    Some(InstanceLock { _file: f })
 }
 
 fn main() {
@@ -1394,6 +1552,10 @@ fn main() {
     }
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    let _lock = acquire_instance_lock().unwrap_or_else(|| {
+        std::process::exit(1);
+    });
 
     let probe_path = args
         .iter()
