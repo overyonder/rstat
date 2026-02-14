@@ -94,8 +94,10 @@ The binary requires `CAP_SYS_ADMIN` (or equivalent, e.g. NixOS
 
 ## Controls
 
-**Left-click** cycles the update interval: 2000ms → 1000 → 500 → 250 → 100 →
-2000ms. The 100ms floor is the fastest Waybar can reliably render with GTK --
+Default interval is **500ms**.
+
+**Left-click** cycles the update interval: 500ms → 250 → 100 → 2000 → 1000 →
+500ms. The 100ms floor is the fastest Waybar can reliably render with GTK --
 below that, pipe backpressure throttles output regardless of sample speed.
 
 ```sh
@@ -109,9 +111,11 @@ interval to 16ms (~60 fps). Pipe to a terminal or TUI that can keep up:
 sudo rstat --ludicrous
 ```
 
-**Middle-click** toggles kernel thread visibility. When enabled, a "Kernel"
-section appears in the tooltip showing the top-5 kernel threads by CPU
-(kworkers, ksoftirqd, migration threads, etc.).
+Kernel mode is **enabled by default**.
+
+**Middle-click** toggles kernel inclusion for all relevant sections (CPU,
+Memory, IO). The tooltip footer shows the current mode as `Kernel included` or
+`Kernel excluded`.
 
 ```sh
 kill -RTMIN+1 $(pgrep rstat)

@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
-const INTERVALS: [u64; 6] = [2000, 1000, 500, 250, 100, 2000];
-static INTERVAL_MS: AtomicU64 = AtomicU64::new(2000);
-static SHOW_KTHREADS: AtomicBool = AtomicBool::new(false);
+const INTERVALS: [u64; 6] = [500, 250, 100, 2000, 1000, 500];
+static INTERVAL_MS: AtomicU64 = AtomicU64::new(500);
+static INCLUDE_KERNEL: AtomicBool = AtomicBool::new(true);
 static MAP_CAP_WARNED: AtomicBool = AtomicBool::new(false);
 const PAGE_SIZE: u64 = 4096;
 const GPU_DIR: &str = "/sys/class/drm/card1/gt/gt0";
@@ -386,7 +386,8 @@ struct BpfPidStats {
     comm: [u8; 16],
     state: u8,
     seen: u8, // client sets on first observation; probe clears on exit/free
-    _pad: u16,
+    is_kthread: u8,
+    _pad: u8,
 }
 
 #[repr(C)]
@@ -973,12 +974,13 @@ struct Sample {
     throttle: ([u8; 64], usize),
     profile: [u8; 32],
     profile_len: u8,
+    include_kernel: bool,
+    io_total_dr: u64,
+    io_total_dw: u64,
     top_cpu: Top5,
     top_mem: Top5,
     top_io: IoTop5,
-    top_kthread: Top5,
     blocked: StateList,
-    show_kthreads: bool,
     ts: Instant,
 }
 
@@ -1077,19 +1079,22 @@ fn take_sample(
     profile[..pl].copy_from_slice(&buf[..pl]);
 
     let total_ns = (elapsed_s * 1_000_000_000.0 * cores as f64) as u64;
-    let show_kt = SHOW_KTHREADS.load(Ordering::Relaxed);
+    let include_kernel = INCLUDE_KERNEL.load(Ordering::Relaxed);
     let mut top_cpu = Top5::new();
     let mut top_mem = Top5::new();
     let mut top_io = IoTop5::new();
-    let mut top_kthread = Top5::new();
     let mut blocked = StateList::new();
-    let mut procs: HashMap<u32, ProcAgg> = HashMap::new();
+    let mut user_procs: HashMap<u32, ProcAgg> = HashMap::new();
+    let mut kernel_tasks: HashMap<[u8; COMM_LEN], ProcAgg> = HashMap::new();
     let min_io = if elapsed_s > 0.0 {
         (MIN_IO_BYTES as f64 * elapsed_s) as u64
     } else {
         u64::MAX
     };
-    let mut busy_ns = 0u64;
+    let mut busy_user_ns = 0u64;
+    let mut busy_kernel_ns = 0u64;
+    let mut io_total_dr = 0u64;
+    let mut io_total_dw = 0u64;
 
     for &(pid, ref st) in &cur.entries {
         if pid == me || pid == parent || pid == 0 {
@@ -1099,32 +1104,31 @@ fn take_sample(
         if cl == 0 {
             continue;
         }
-        if st.state == b'D' || (st.state == b'Z' && st.seen != 0) {
-            if st.rss_pages == 0 {
-                blocked.push(st.state, &st.comm[..cl]);
-            }
-        }
-
         let prev_st = prev.get(pid);
         let prev_cpu = prev_st.map(|p| p.cpu_ns).unwrap_or(0);
         let dcpu = st.cpu_ns.saturating_sub(prev_cpu);
-        busy_ns += dcpu;
-
-        // Kernel threads have no mm, so rss_pages == 0
-        let is_kthread = st.rss_pages == 0;
-
-        if is_kthread {
-            if show_kt && total_ns > 0 && dcpu > 0 {
-                top_kthread.insert(dcpu, &st.comm[..cl]);
-            }
-            continue;
-        }
         let (prb, pwb) = prev_st.map(|p| (p.io_rb, p.io_wb)).unwrap_or((0, 0));
         let drb = st.io_rb.saturating_sub(prb);
         let dwb = st.io_wb.saturating_sub(pwb);
 
+        if st.is_kthread != 0 {
+            busy_kernel_ns = busy_kernel_ns.saturating_add(dcpu);
+            let mut key = [0u8; COMM_LEN];
+            key[..cl].copy_from_slice(&st.comm[..cl]);
+            let e = kernel_tasks.entry(key).or_insert_with(ProcAgg::new);
+            e.cpu_ns = e.cpu_ns.saturating_add(dcpu);
+            e.rss_bytes = e.rss_bytes.max(st.rss_pages.saturating_mul(PAGE_SIZE));
+            e.io_dr = e.io_dr.saturating_add(drb);
+            e.io_dw = e.io_dw.saturating_add(dwb);
+            e.has_d |= st.state == b'D';
+            e.has_z |= st.state == b'Z' && st.seen != 0;
+            e.set_comm(&st.comm[..cl]);
+            continue;
+        }
+
+        busy_user_ns = busy_user_ns.saturating_add(dcpu);
         let tgid = if st.tgid != 0 { st.tgid } else { pid };
-        let e = procs.entry(tgid).or_insert_with(ProcAgg::new);
+        let e = user_procs.entry(tgid).or_insert_with(ProcAgg::new);
         e.cpu_ns = e.cpu_ns.saturating_add(dcpu);
         e.rss_bytes = e.rss_bytes.max(st.rss_pages.saturating_mul(PAGE_SIZE));
         e.io_dr = e.io_dr.saturating_add(drb);
@@ -1134,10 +1138,14 @@ fn take_sample(
         e.set_comm(&st.comm[..cl]);
     }
 
-    for e in procs.values() {
+    for e in user_procs.values() {
         if e.cl == 0 {
             continue;
         }
+
+        io_total_dr = io_total_dr.saturating_add(e.io_dr);
+        io_total_dw = io_total_dw.saturating_add(e.io_dw);
+
         if e.has_d {
             blocked.push(b'D', &e.comm[..e.cl as usize]);
         } else if e.has_z {
@@ -1161,6 +1169,45 @@ fn take_sample(
         }
     }
 
+    if include_kernel {
+        for e in kernel_tasks.values() {
+            if e.cl == 0 {
+                continue;
+            }
+
+            io_total_dr = io_total_dr.saturating_add(e.io_dr);
+            io_total_dw = io_total_dw.saturating_add(e.io_dw);
+
+            if e.has_d {
+                blocked.push(b'D', &e.comm[..e.cl as usize]);
+            } else if e.has_z {
+                blocked.push(b'Z', &e.comm[..e.cl as usize]);
+            }
+
+            if total_ns > 0 && e.cpu_ns > 0 {
+                let thr_ns = (MIN_CPU_PCT * total_ns as f64 / 100.0) as u64;
+                if e.cpu_ns >= thr_ns {
+                    top_cpu.insert(e.cpu_ns, &e.comm[..e.cl as usize]);
+                }
+            }
+
+            if e.rss_bytes >= MIN_MEM_BYTES {
+                top_mem.insert(e.rss_bytes, &e.comm[..e.cl as usize]);
+            }
+
+            let dt = e.io_dr.saturating_add(e.io_dw);
+            if dt >= min_io {
+                top_io.insert(dt, e.io_dr, e.io_dw, &e.comm[..e.cl as usize]);
+            }
+        }
+    }
+
+    let busy_ns = if include_kernel {
+        busy_user_ns.saturating_add(busy_kernel_ns)
+    } else {
+        busy_user_ns
+    };
+
     let cpu_pct = if total_ns > 0 && elapsed_s > 0.0 {
         (busy_ns as f64 / total_ns as f64 * 100.0).clamp(0.0, 100.0)
     } else {
@@ -1182,12 +1229,13 @@ fn take_sample(
         throttle: thr,
         profile,
         profile_len: pl as u8,
+        include_kernel,
+        io_total_dr,
+        io_total_dw,
         top_cpu,
         top_mem,
         top_io,
-        top_kthread,
         blocked,
-        show_kthreads: show_kt,
         ts: Instant::now(),
     }
 }
@@ -1316,6 +1364,12 @@ fn emit(
     }
 
     tt.push_str("\n\n IO/s");
+    if elapsed_s > 0.0 {
+        let tr = cur.io_total_dr as f64 / 1_048_576.0 / elapsed_s;
+        let tw = cur.io_total_dw as f64 / 1_048_576.0 / elapsed_s;
+        let ttot = tr + tw;
+        let _ = write!(tt, " {ttot:.1}M/s (R:{tr:.1} W:{tw:.1})");
+    }
     let entries = cur.top_io.sorted();
     if entries.is_empty() {
         tt.push_str("\n  ---");
@@ -1331,29 +1385,17 @@ fn emit(
             );
         }
     }
-    if cur.show_kthreads {
-        tt.push_str("\n\n Kernel");
-        let entries = cur.top_kthread.sorted();
-        if entries.is_empty() {
-            tt.push_str("\n  ---");
-        } else {
-            let total_ns = elapsed_s * cur.cores as f64 * 1_000_000_000.0;
-            for e in entries {
-                let pct = if total_ns > 0.0 {
-                    e.val as f64 * 100.0 / total_ns
-                } else {
-                    0.0
-                };
-                let _ = write!(tt, "\n{pct:5.1}%  {}", comm_str(&e.comm, e.cl));
-            }
-        }
-    }
 
     let ival = INTERVAL_MS.load(Ordering::Relaxed);
     let _ = write!(
         tt,
         "\n\nSampled in {:.1}ms (every {ival}ms)",
         dur.as_secs_f64() * 1000.0
+    );
+    let _ = write!(
+        tt,
+        "\nKernel {}",
+        if cur.include_kernel { "included" } else { "excluded" }
     );
 
     // Build JSON directly
@@ -1389,7 +1431,7 @@ extern "C" fn sig_cycle(_: libc::c_int) {
 }
 
 extern "C" fn sig_kthreads(_: libc::c_int) {
-    SHOW_KTHREADS.fetch_xor(true, Ordering::Relaxed);
+    INCLUDE_KERNEL.fetch_xor(true, Ordering::Relaxed);
 }
 
 fn sleep_or_signal(ms: u64) {
@@ -1464,15 +1506,30 @@ fn seed_existing_dz(stats_fd: RawFd) -> usize {
         };
         let b = &buf[..len];
         // Format: pid (comm) state ...
-        // Find closing ')' then state is the next non-space char
+        // Find closing ')' then parse tokens from state onward.
         let Some(cp) = b.iter().rposition(|&c| c == b')') else {
             continue;
         };
         let rest = &b[cp + 1..];
-        let state = match rest.iter().find(|&&c| c != b' ') {
-            Some(&s) if s == b'D' || s == b'Z' => s,
+        let mut toks = rest.split(|&c| c == b' ').filter(|t| !t.is_empty());
+        let state = match toks.next() {
+            Some(s) if s.len() == 1 && (s[0] == b'D' || s[0] == b'Z') => s[0],
             _ => continue,
         };
+        // /proc/[pid]/stat field 23 is vsize; kernel threads have vsize=0.
+        let mut is_kthread = false;
+        let mut ok = true;
+        for _ in 0..19 {
+            if toks.next().is_none() {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            if let Some(vsize) = toks.next() {
+                is_kthread = parse_u64_trim(vsize) == 0;
+            }
+        }
         // Extract comm from between '(' and ')'
         let op = match b.iter().position(|&c| c == b'(') {
             Some(i) => i + 1,
@@ -1482,6 +1539,7 @@ fn seed_existing_dz(stats_fd: RawFd) -> usize {
         let mut st = BpfPidStats::default();
         st.state = state;
         st.tgid = pid;
+        st.is_kthread = if is_kthread { 1 } else { 0 };
         if state == b'Z' {
             st.seen = 1;
         } // pre-existing zombie: display immediately

@@ -7,6 +7,7 @@
 
 #define TASK_COMM_LEN 16
 #define MAX_PIDS 8192
+#define PF_KTHREAD 0x00200000UL
 
 // Per-PID stats: cumulative cpu_ns, latest snapshots for rss/io
 struct pid_stats {
@@ -18,7 +19,8 @@ struct pid_stats {
     char  comm[TASK_COMM_LEN];
     __u8  state;        // 'D' = uninterruptible, 'Z' = zombie, 0 = normal
     __u8  seen;         // client sets on first observation; cleared on exit/free
-    __u16 _pad;
+    __u8  is_kthread;   // task->flags & PF_KTHREAD
+    __u8  _pad;
 };
 
 // System-wide counters
@@ -107,6 +109,10 @@ static __always_inline void snapshot_task(struct pid_stats *s)
     __u32 tgid = 0;
     bpf_probe_read_kernel(&tgid, sizeof(tgid), &task->tgid);
     s->tgid = tgid;
+
+    unsigned long flags = 0;
+    bpf_probe_read_kernel(&flags, sizeof(flags), &task->flags);
+    s->is_kthread = (flags & PF_KTHREAD) ? 1 : 0;
 
     // RSS: mm->rss_stat[0..3].count (percpu_counter approx value)
     // indices: 0=file, 1=anon, 2=swap, 3=shmem; RSS = file+anon+shmem
