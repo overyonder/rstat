@@ -741,19 +741,16 @@ impl BpfLoader {
                 let Some(pfd) = perf_event_open_tracepoint(tp_id, cpu) else {
                     continue;
                 };
-                if cpu == 0 {
-                    let r =
-                        unsafe { libc::ioctl(pfd, PERF_EVENT_IOC_SET_BPF as libc::c_ulong, fd) };
-                    if r < 0 {
-                        eprintln!(
-                            "bpf: attach failed for {sec_name}: {}",
-                            io::Error::last_os_error()
-                        );
-                        unsafe {
-                            libc::close(pfd);
-                        }
-                        continue;
+                let r = unsafe { libc::ioctl(pfd, PERF_EVENT_IOC_SET_BPF as libc::c_ulong, fd) };
+                if r < 0 {
+                    eprintln!(
+                        "bpf: attach failed for {sec_name} cpu {cpu}: {}",
+                        io::Error::last_os_error()
+                    );
+                    unsafe {
+                        libc::close(pfd);
                     }
+                    continue;
                 }
                 unsafe { libc::ioctl(pfd, PERF_EVENT_IOC_ENABLE as libc::c_ulong, 0) };
                 perf_fds.push(pfd);

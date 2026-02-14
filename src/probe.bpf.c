@@ -212,7 +212,8 @@ struct sched_process_free_args {
     unsigned char  common_flags;
     unsigned char  common_preempt_count;
     int            common_pid;
-    char           comm[16];
+    // tracepoint format is __data_loc char[] comm (u32 location/size descriptor)
+    __u32          comm_loc;
     int            pid;
     int            prio;
 };
