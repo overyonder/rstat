@@ -1507,8 +1507,21 @@ struct InstanceLock {
 }
 
 fn acquire_instance_lock() -> Option<InstanceLock> {
-    let uid = unsafe { libc::geteuid() };
-    let p = format!("/run/user/{uid}/rstat.lock");
+    let uid = unsafe { libc::getuid() };
+    let mut dir = std::env::var("XDG_RUNTIME_DIR").ok();
+    if dir
+        .as_deref()
+        .map(|d| std::path::Path::new(d).is_dir())
+        != Some(true)
+    {
+        let run_user = format!("/run/user/{uid}");
+        dir = if std::path::Path::new(&run_user).is_dir() {
+            Some(run_user)
+        } else {
+            Some("/tmp".to_string())
+        };
+    }
+    let p = format!("{}/rstat.lock", dir.unwrap_or_else(|| "/tmp".to_string()));
     let f = match fs::OpenOptions::new()
         .create(true)
         .read(true)
