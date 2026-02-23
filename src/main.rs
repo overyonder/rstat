@@ -213,6 +213,8 @@ struct SysFds {
     gpu_freq: fs::File,
     gpu_max: fs::File,
     profile: fs::File,
+    psi_mem: Option<fs::File>,
+    vmstat: Option<fs::File>,
     throttle: Vec<ThrottleFile>,
 }
 
@@ -253,6 +255,8 @@ impl SysFds {
             gpu_freq: fs::File::open(&format!("{GPU_DIR}/rps_act_freq_mhz")).expect("gpu_freq"),
             gpu_max: fs::File::open(&format!("{GPU_DIR}/rps_max_freq_mhz")).expect("gpu_max"),
             profile: fs::File::open("/sys/firmware/acpi/platform_profile").expect("profile"),
+            psi_mem: fs::File::open("/proc/pressure/memory").ok(),
+            vmstat: fs::File::open("/proc/vmstat").ok(),
             throttle,
         }
     }
@@ -292,6 +296,43 @@ fn parse_u64_trim(b: &[u8]) -> u64 {
         }
     }
     v
+}
+
+fn parse_psi_total(line: &[u8]) -> Option<u64> {
+    let mut i = 0usize;
+    while i + 6 <= line.len() {
+        if &line[i..i + 6] == b"total=" {
+            return Some(parse_u64_trim(&line[i + 6..]));
+        }
+        i += 1;
+    }
+    None
+}
+
+fn parse_psi_memory_totals(b: &[u8]) -> (Option<u64>, Option<u64>) {
+    let mut some = None;
+    let mut full = None;
+    for line in b.split(|&c| c == b'\n') {
+        if line.starts_with(b"some ") {
+            some = parse_psi_total(line);
+        } else if line.starts_with(b"full ") {
+            full = parse_psi_total(line);
+        }
+    }
+    (some, full)
+}
+
+fn parse_vmstat_swap_pages(b: &[u8]) -> (Option<u64>, Option<u64>) {
+    let mut pswpin = None;
+    let mut pswpout = None;
+    for line in b.split(|&c| c == b'\n') {
+        if line.starts_with(b"pswpin ") {
+            pswpin = Some(parse_u64_trim(&line[7..]));
+        } else if line.starts_with(b"pswpout ") {
+            pswpout = Some(parse_u64_trim(&line[8..]));
+        }
+    }
+    (pswpin, pswpout)
 }
 
 fn read_raw(path: &str, buf: &mut [u8]) -> Option<usize> {
@@ -977,6 +1018,10 @@ struct Sample {
     include_kernel: bool,
     io_total_dr: u64,
     io_total_dw: u64,
+    psi_mem_some_total_us: Option<u64>,
+    psi_mem_full_total_us: Option<u64>,
+    pswpin_pages: Option<u64>,
+    pswpout_pages: Option<u64>,
     top_cpu: Top5,
     top_mem: Top5,
     top_io: IoTop5,
@@ -1051,6 +1096,8 @@ fn take_sample(
     elapsed_s: f64,
     cur: &PidStats,
     prev: &PidStats,
+    psi_buf: &mut [u8],
+    vm_buf: &mut [u8],
 ) -> Sample {
     let si = get_sysinfo();
     let mu = si.mem_unit.max(1) as u64;
@@ -1069,6 +1116,21 @@ fn take_sample(
     let cf = pread_u64(&fds.freq, buf);
     let cfm = pread_u64(&fds.fmax, buf);
     let thr = sample_throttle(&mut fds.throttle, buf);
+
+    let (psi_mem_some_total_us, psi_mem_full_total_us) = if let Some(f) = &fds.psi_mem {
+        let n = pread_raw(f, psi_buf);
+        parse_psi_memory_totals(&psi_buf[..n])
+    } else {
+        (None, None)
+    };
+
+    let (pswpin_pages, pswpout_pages) = if let Some(f) = &fds.vmstat {
+        let n = pread_raw(f, vm_buf);
+        parse_vmstat_swap_pages(&vm_buf[..n])
+    } else {
+        (None, None)
+    };
+
     let pn = pread_raw(&fds.profile, buf);
     let mut profile = [0u8; 32];
     let mut pl = pn;
@@ -1232,6 +1294,10 @@ fn take_sample(
         include_kernel,
         io_total_dr,
         io_total_dw,
+        psi_mem_some_total_us,
+        psi_mem_full_total_us,
+        pswpin_pages,
+        pswpout_pages,
         top_cpu,
         top_mem,
         top_io,
@@ -1274,6 +1340,37 @@ fn emit(
     let mpct = if mt > 0 { 100 * mused / mt } else { 0 };
     let mused_g = mused as f64 / 1_073_741_824.0;
     let mtotal_g = mt as f64 / 1_073_741_824.0;
+
+    let mut psi_some_pct = None;
+    let mut psi_full_pct = None;
+    let mut swap_in_ps = None;
+    let mut swap_out_ps = None;
+    if let Some(p) = prev {
+        if elapsed_s > 0.0 {
+            if let (Some(cur_some), Some(prev_some)) =
+                (cur.psi_mem_some_total_us, p.psi_mem_some_total_us)
+            {
+                psi_some_pct = Some(
+                    (cur_some.saturating_sub(prev_some) as f64 / (elapsed_s * 1_000_000.0) * 100.0)
+                        .clamp(0.0, 100.0),
+                );
+            }
+            if let (Some(cur_full), Some(prev_full)) =
+                (cur.psi_mem_full_total_us, p.psi_mem_full_total_us)
+            {
+                psi_full_pct = Some(
+                    (cur_full.saturating_sub(prev_full) as f64 / (elapsed_s * 1_000_000.0) * 100.0)
+                        .clamp(0.0, 100.0),
+                );
+            }
+            if let (Some(cur_in), Some(prev_in)) = (cur.pswpin_pages, p.pswpin_pages) {
+                swap_in_ps = Some(cur_in.saturating_sub(prev_in) as f64 / elapsed_s);
+            }
+            if let (Some(cur_out), Some(prev_out)) = (cur.pswpout_pages, p.pswpout_pages) {
+                swap_out_ps = Some(cur_out.saturating_sub(prev_out) as f64 / elapsed_s);
+            }
+        }
+    }
 
     let ratio = cur.load[0] / cur.cores.max(1) as f64;
     let class = if ratio >= 2.0 {
@@ -1353,6 +1450,18 @@ fn emit(
         tt,
         "\n\n Memory    {mused_g:.1}/{mtotal_g:.1} GiB ({mpct}%)"
     );
+    match (psi_some_pct, psi_full_pct) {
+        (Some(some), Some(full)) => {
+            let _ = write!(tt, "\n PSI some/full: {some:.1}%/{full:.1}%");
+        }
+        _ => tt.push_str("\n PSI some/full: n/a"),
+    }
+    match (swap_in_ps, swap_out_ps) {
+        (Some(sin), Some(sout)) => {
+            let _ = write!(tt, "\n Swap: {:.0} pages/s (in:{sin:.0} out:{sout:.0})", sin + sout);
+        }
+        _ => tt.push_str("\n Swap: n/a"),
+    }
     let entries = cur.top_mem.sorted();
     if entries.is_empty() {
         tt.push_str("\n  ---");
@@ -1608,6 +1717,8 @@ fn acquire_instance_lock() -> Option<InstanceLock> {
 
 fn main() {
     let mut buf = [0u8; 64];
+    let mut psi_buf = [0u8; 256];
+    let mut vm_buf = [0u8; 8192];
     let me = std::process::id();
     let parent = unsafe { libc::getppid() } as u32;
     let cores = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) } as u32;
@@ -1616,9 +1727,9 @@ fn main() {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_flags = libc::SA_RESTART;
-        sa.sa_sigaction = sig_cycle as usize;
+        sa.sa_sigaction = sig_cycle as *const () as usize;
         libc::sigaction(libc::SIGRTMIN(), &sa, std::ptr::null_mut());
-        sa.sa_sigaction = sig_kthreads as usize;
+        sa.sa_sigaction = sig_kthreads as *const () as usize;
         libc::sigaction(libc::SIGRTMIN() + 1, &sa, std::ptr::null_mut());
     }
 
@@ -1701,7 +1812,18 @@ fn main() {
             let t0 = Instant::now();
             let es = t0.duration_since(last_ts).as_secs_f64();
             bpf.read_stats(&mut cur);
-            let _ = take_sample(me, parent, &mut buf, &mut fds, cores, es, &cur, &prev);
+            let _ = take_sample(
+                me,
+                parent,
+                &mut buf,
+                &mut fds,
+                cores,
+                es,
+                &cur,
+                &prev,
+                &mut psi_buf,
+                &mut vm_buf,
+            );
             times.push(t0.elapsed());
             last_ts = t0;
             std::mem::swap(&mut cur, &mut prev);
@@ -1726,7 +1848,18 @@ fn main() {
 
     // First sample (no deltas)
     bpf.read_stats(&mut prev);
-    let mut s = take_sample(me, parent, &mut buf, &mut fds, cores, 0.0, &prev, &cur);
+    let mut s = take_sample(
+        me,
+        parent,
+        &mut buf,
+        &mut fds,
+        cores,
+        0.0,
+        &prev,
+        &cur,
+        &mut psi_buf,
+        &mut vm_buf,
+    );
     emit(
         None,
         &mut s,
@@ -1743,7 +1876,18 @@ fn main() {
         let es = t0.duration_since(prev_sample.ts).as_secs_f64();
         bpf.read_stats(&mut cur);
         bpf.ack_zombies(&cur);
-        let mut s = take_sample(me, parent, &mut buf, &mut fds, cores, es, &cur, &prev);
+        let mut s = take_sample(
+            me,
+            parent,
+            &mut buf,
+            &mut fds,
+            cores,
+            es,
+            &cur,
+            &prev,
+            &mut psi_buf,
+            &mut vm_buf,
+        );
         let dur = t0.elapsed();
         emit(
             Some(&prev_sample),

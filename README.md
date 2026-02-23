@@ -18,9 +18,10 @@ RSS, and IO counters directly from `task_struct` -- no files, no syscalls, no
 text parsing. Userspace reads the results from a BPF map in a single batch
 operation.
 
-The result: a complete system health snapshot (CPU%, memory, load, temperature,
-frequency, GPU, power profile, top-5 processes by CPU/memory/IO with per-process
-breakdowns) in **under 1 millisecond** per sample, with each in-kernel probe
+The result: a complete system health snapshot (CPU%, memory, memory pressure,
+swap rate, load, temperature, frequency, GPU, power profile, top-5 processes by
+CPU/memory/IO with per-process breakdowns) in **under 1 millisecond** per
+sample, with each in-kernel probe
 invocation completing in **single-digit microseconds**.
 
 [![Read the full writeup](https://img.shields.io/badge/Read_the_writeup-over--yonder.tech-1a6e2e?style=for-the-badge)](https://over-yonder.tech/#articles/rstat)
@@ -40,6 +41,8 @@ Runtime guarantees:
 - Strict probe health checks at startup (required tracepoints must attach)
 - Single-instance lock to avoid partial/competing probe attachments
 - Per-thread kernel data aggregated to per-process rows in userspace (by TGID)
+- Memory PSI (`/proc/pressure/memory`) and swap counters (`/proc/vmstat`) read
+  from persistent file descriptors each sample (no per-tick reopen churn)
 
 **Startup /proc scan** seeds any pre-existing D/Z processes into the BPF map so
 they're visible from the first sample.
