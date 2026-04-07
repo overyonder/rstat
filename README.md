@@ -1,5 +1,18 @@
 # rstat
 
+> [!WARNING]
+> `rstat` is a demonstration and performance research exercise, not a production
+> desktop application. It is provided as an educational resource on eBPF
+> programming and low-overhead system telemetry.
+>
+> It has not undergone the QA, compatibility work, hardening, or security
+> testing expected of general desktop software. Known limitations include
+> machine-specific hardware assumptions, a fixed PID/map capacity, unchecked
+> string handling, and incomplete reliability work around multicore probe
+> attachment and cross-system support. Those are examples of the broader point:
+> proper desktop monitoring software needs substantial validation that this
+> project will not receive.
+
 **A system monitor that runs inside the kernel. Single-digit microseconds per
 switch, sub-millisecond per sample. More data than `top`, `iotop`, and `ps`
 combined.**
