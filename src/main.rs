@@ -1087,6 +1087,25 @@ impl ProcAgg {
     }
 }
 
+struct SampleScratch {
+    user_procs: HashMap<u32, ProcAgg>,
+    kernel_tasks: HashMap<[u8; COMM_LEN], ProcAgg>,
+}
+
+impl SampleScratch {
+    fn new() -> Self {
+        Self {
+            user_procs: HashMap::with_capacity(MAX_PIDS / 4),
+            kernel_tasks: HashMap::with_capacity(256),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.user_procs.clear();
+        self.kernel_tasks.clear();
+    }
+}
+
 fn take_sample(
     me: u32,
     parent: u32,
@@ -1098,6 +1117,7 @@ fn take_sample(
     prev: &PidStats,
     psi_buf: &mut [u8],
     vm_buf: &mut [u8],
+    scratch: &mut SampleScratch,
 ) -> Sample {
     let si = get_sysinfo();
     let mu = si.mem_unit.max(1) as u64;
@@ -1146,8 +1166,7 @@ fn take_sample(
     let mut top_mem = Top5::new();
     let mut top_io = IoTop5::new();
     let mut blocked = StateList::new();
-    let mut user_procs: HashMap<u32, ProcAgg> = HashMap::new();
-    let mut kernel_tasks: HashMap<[u8; COMM_LEN], ProcAgg> = HashMap::new();
+    scratch.clear();
     let min_io = if elapsed_s > 0.0 {
         (MIN_IO_BYTES as f64 * elapsed_s) as u64
     } else {
@@ -1177,7 +1196,7 @@ fn take_sample(
             busy_kernel_ns = busy_kernel_ns.saturating_add(dcpu);
             let mut key = [0u8; COMM_LEN];
             key[..cl].copy_from_slice(&st.comm[..cl]);
-            let e = kernel_tasks.entry(key).or_insert_with(ProcAgg::new);
+            let e = scratch.kernel_tasks.entry(key).or_insert_with(ProcAgg::new);
             e.cpu_ns = e.cpu_ns.saturating_add(dcpu);
             e.rss_bytes = e.rss_bytes.max(st.rss_pages.saturating_mul(PAGE_SIZE));
             e.io_dr = e.io_dr.saturating_add(drb);
@@ -1190,7 +1209,7 @@ fn take_sample(
 
         busy_user_ns = busy_user_ns.saturating_add(dcpu);
         let tgid = if st.tgid != 0 { st.tgid } else { pid };
-        let e = user_procs.entry(tgid).or_insert_with(ProcAgg::new);
+        let e = scratch.user_procs.entry(tgid).or_insert_with(ProcAgg::new);
         e.cpu_ns = e.cpu_ns.saturating_add(dcpu);
         e.rss_bytes = e.rss_bytes.max(st.rss_pages.saturating_mul(PAGE_SIZE));
         e.io_dr = e.io_dr.saturating_add(drb);
@@ -1200,7 +1219,7 @@ fn take_sample(
         e.set_comm(&st.comm[..cl]);
     }
 
-    for e in user_procs.values() {
+    for e in scratch.user_procs.values() {
         if e.cl == 0 {
             continue;
         }
@@ -1232,7 +1251,7 @@ fn take_sample(
     }
 
     if include_kernel {
-        for e in kernel_tasks.values() {
+        for e in scratch.kernel_tasks.values() {
             if e.cl == 0 {
                 continue;
             }
@@ -1796,6 +1815,7 @@ fn main() {
     // Pre-allocated, reused every tick (zero-alloc steady state)
     let mut cur = PidStats::with_capacity(MAX_PIDS);
     let mut prev = PidStats::with_capacity(MAX_PIDS);
+    let mut scratch = SampleScratch::new();
     let mut tt = String::with_capacity(1024);
     let mut json = String::with_capacity(1536);
     let mut text_buf = String::with_capacity(16);
@@ -1823,6 +1843,7 @@ fn main() {
                 &prev,
                 &mut psi_buf,
                 &mut vm_buf,
+                &mut scratch,
             );
             times.push(t0.elapsed());
             last_ts = t0;
@@ -1859,6 +1880,7 @@ fn main() {
         &cur,
         &mut psi_buf,
         &mut vm_buf,
+        &mut scratch,
     );
     emit(
         None,
@@ -1887,6 +1909,7 @@ fn main() {
             &prev,
             &mut psi_buf,
             &mut vm_buf,
+            &mut scratch,
         );
         let dur = t0.elapsed();
         emit(
