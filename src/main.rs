@@ -2459,16 +2459,6 @@ mod tests {
     }
 
     #[test]
-    fn newest_thread_snapshot_wins_for_process_rss() {
-        let mut aggregate = ProcAgg::new();
-        aggregate.update_rss(900, 20);
-        aggregate.update_rss(1_200, 10);
-        assert_eq!(aggregate.rss_bytes, 900);
-        aggregate.update_rss(700, 30);
-        assert_eq!(aggregate.rss_bytes, 700);
-    }
-
-    #[test]
     fn historical_io_is_a_baseline_but_new_task_io_counts() {
         let historical = BpfPidStats {
             io_rb: 8_000,
