@@ -231,6 +231,12 @@ Both counts must be positive. The two modes can't be combined.
 - The custom loader, signal handling, output path, and broad kernel
   compatibility haven't received production hardening.
 
+## Open work
+
+Blocked-task diagnostics currently combine user threads by process and kernel
+threads by command name. Per-thread (TID) blocked diagnostics remain an open
+requirement, with CPU, memory and I/O rankings aggregated by process.
+
 ## Case study
 
 [Read the condensed performance case study](https://over-yonder.tech/work/rstat.html).
