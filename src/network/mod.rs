@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
+use crate::config::NetworkConfig;
 use crate::markup::{Markup, MarkupColors, Severity, WaybarReport};
 use crate::procfs_file::{ProcfsFile, read_trimmed};
 
@@ -52,10 +53,11 @@ pub(crate) struct NetworkSampler {
     cifs_debug:    Option<ProcfsFile>,
     previous:      Option<(Instant, NetworkCounters)>,
     retransmits:   VecDeque<(Instant, u64, u64)>,  // Per interval: end, segments sent, retransmitted
+    items:         NetworkConfig,
 }
 
 impl NetworkSampler {
-    pub(crate) fn open() -> std::io::Result<Self> {
+    pub(crate) fn open(items: NetworkConfig) -> std::io::Result<Self> {
         let open = |path: &str| ProcfsFile::open(path).ok_or_else(|| std::io::Error::other(format!("cannot open {path}")));
         Ok(Self {
             dev:         open("/proc/net/dev")?,
@@ -67,6 +69,7 @@ impl NetworkSampler {
             cifs_debug:  ProcfsFile::open("/proc/fs/cifs/DebugData"),
             previous:    None,
             retransmits: VecDeque::new(),
+            items,
         })
     }
 
@@ -145,7 +148,8 @@ impl NetworkSampler {
         let window_seconds = now.duration_since(window_start).as_secs_f64() + seconds;
         let (sent, retransmitted) = self.retransmits.iter().fold((0, 0), |(sent, retransmitted), (_, s, r)| (sent + s, retransmitted + r));
         let ratio = if sent > 0 { 100.0 * retransmitted as f64 / sent as f64 } else { 0.0 };
-        let ratio_severity = if sent >= RETRANSMISSION_MINIMUM_SEGMENTS { Severity::of_high(ratio, 2.0, 10.0) } else { Severity::Ok };
+        let items = self.items;
+        let ratio_severity = if items.retransmissions && sent >= RETRANSMISSION_MINIMUM_SEGMENTS { Severity::of_high(ratio, 2.0, 10.0) } else { Severity::Ok };
 
         // Time spent on completed NAS requests per second of wall time is the average number of requests
         // outstanding: how many tasks are, on average, waiting on the NAS.
@@ -158,45 +162,53 @@ impl NetworkSampler {
         });
 
         let mut tooltip = Markup::new(colors);
-        tooltip.heading("NAS (SMB)");
-        tooltip
-            .line()
-            .label("Requests outstanding on average: ")
-            .high(nas_wait, &format!("{nas_wait:.2}"), 4.0, 16.0)
-            .label(" · active now: ")
-            .value(&active_now.to_string());
-        tooltip
-            .line()
-            .label("Requests: ")
-            .value(&format!("{:.0}/s", nas_requests / seconds))
-            .label(" · average time: ")
-            .high(nas_latency, &format!("{nas_latency:.1} ms"), 20.0, 100.0);
+        if items.nas {
+            tooltip.heading("NAS (SMB)");
+            tooltip
+                .line()
+                .label("Requests outstanding on average: ")
+                .high(nas_wait, &format!("{nas_wait:.2}"), 4.0, 16.0)
+                .label(" · active now: ")
+                .value(&active_now.to_string());
+            tooltip
+                .line()
+                .label("Requests: ")
+                .value(&format!("{:.0}/s", nas_requests / seconds))
+                .label(" · average time: ")
+                .high(nas_latency, &format!("{nas_latency:.1} ms"), 20.0, 100.0);
+        }
 
         let rate = |name: &str, unit: &str| (per_second(name), format!("{:.0}{unit}", per_second(name)));
-        tooltip.heading("TCP and UDP");
-        tooltip
-            .line()
-            .label(&format!("Retransmissions over {window_seconds:.0}s: "))
-            .toned(ratio_severity, &format!("{ratio:.2}%"))
-            .label(" of ")
-            .value(&sent.to_string())
-            .label(" segments sent");
-        let (retransmit_rate, retransmit_text) = rate("Tcp.RetransSegs", " retransmits/s");
-        let (timeout_rate, timeout_text) = rate("TcpExt.TCPTimeouts", " timeouts/s");
-        tooltip
-            .line()
-            .label(&format!("Last {seconds:.0}s: "))
-            .high(retransmit_rate, &retransmit_text, 10.0, 100.0)
-            .label(", ")
-            .high(timeout_rate, &timeout_text, 1.0, 10.0)
-            .label(", ")
-            .value(&format!("{:.0} segments out/s, {:.0} in/s", per_second("Tcp.OutSegs"), per_second("Tcp.InSegs")));
-        tooltip
-            .line()
-            .label("Established connections: ")
-            .value(&counters.protocol.get("Tcp.CurrEstab").copied().unwrap_or(0).to_string())
-            .label(" · new: ")
-            .value(&format!("{:.0}/s outgoing, {:.0}/s incoming", per_second("Tcp.ActiveOpens"), per_second("Tcp.PassiveOpens")));
+        if items.retransmissions || items.connections || items.listen_queue || items.udp_errors || items.kernel_backlog {
+            tooltip.heading("TCP and UDP");
+        }
+        if items.retransmissions {
+            tooltip
+                .line()
+                .label(&format!("Retransmissions over {window_seconds:.0}s: "))
+                .toned(ratio_severity, &format!("{ratio:.2}%"))
+                .label(" of ")
+                .value(&sent.to_string())
+                .label(" segments sent");
+            let (retransmit_rate, retransmit_text) = rate("Tcp.RetransSegs", " retransmits/s");
+            let (timeout_rate, timeout_text) = rate("TcpExt.TCPTimeouts", " timeouts/s");
+            tooltip
+                .line()
+                .label(&format!("Last {seconds:.0}s: "))
+                .high(retransmit_rate, &retransmit_text, 10.0, 100.0)
+                .label(", ")
+                .high(timeout_rate, &timeout_text, 1.0, 10.0)
+                .label(", ")
+                .value(&format!("{:.0} segments out/s, {:.0} in/s", per_second("Tcp.OutSegs"), per_second("Tcp.InSegs")));
+        }
+        if items.connections {
+            tooltip
+                .line()
+                .label("Established connections: ")
+                .value(&counters.protocol.get("Tcp.CurrEstab").copied().unwrap_or(0).to_string())
+                .label(" · new: ")
+                .value(&format!("{:.0}/s outgoing, {:.0}/s incoming", per_second("Tcp.ActiveOpens"), per_second("Tcp.PassiveOpens")));
+        }
         let fault_line = |tooltip: &mut Markup<'_>, title: &str, first: (&str, &str), joiner: &str, second: (&str, &str)| {
             let (first_rate, first_text) = rate(first.0, first.1);
             tooltip.line().label(title).high(first_rate, &first_text, 0.01, 10.0).label(joiner);
@@ -207,56 +219,65 @@ impl NetworkSampler {
                 tooltip.high(second_rate, &second_text, 0.01, 10.0);
             }
         };
-        fault_line(&mut tooltip, "Listen queue: ", ("TcpExt.ListenOverflows", " overflows/s"), ", ", ("TcpExt.ListenDrops", " drops/s"));
-        fault_line(&mut tooltip, "UDP buffer errors: receive ", ("Udp.RcvbufErrors", "/s"), ", send ", ("Udp.SndbufErrors", "/s"));
-        let squeezes = format!("{:.0} time squeezes/s", per_second("Softnet.TimeSqueeze"));
-        fault_line(&mut tooltip, "Kernel backlog: ", ("Softnet.Dropped", " drops/s"), ", ", ("", &squeezes));
+        if items.listen_queue {
+            fault_line(&mut tooltip, "Listen queue: ", ("TcpExt.ListenOverflows", " overflows/s"), ", ", ("TcpExt.ListenDrops", " drops/s"));
+        }
+        if items.udp_errors {
+            fault_line(&mut tooltip, "UDP buffer errors: receive ", ("Udp.RcvbufErrors", "/s"), ", send ", ("Udp.SndbufErrors", "/s"));
+        }
+        if items.kernel_backlog {
+            let squeezes = format!("{:.0} time squeezes/s", per_second("Softnet.TimeSqueeze"));
+            fault_line(&mut tooltip, "Kernel backlog: ", ("Softnet.Dropped", " drops/s"), ", ", ("", &squeezes));
+        }
 
         let default_route = default_route(self.route.read());
-        tooltip.heading("Interfaces");
-        match &default_route {
-            Some((interface, gateway)) => {
-                tooltip.line().label("Default route: ").value(interface).label(" via ").value(gateway);
-            }
-            None => {
-                tooltip.line().toned(Severity::Warning, "No default route");
-            }
-        }
-        let addresses = interface_addresses();
-        let mut names: Vec<&String> = counters.interfaces.keys().collect();
-        names.sort();
-        for name in names {
-            let state = read_trimmed(format!("/sys/class/net/{name}/operstate")).unwrap_or_default();
-            if name == "lo" || state == "down" {
-                continue;
-            }
-            let speed: f64 = read_trimmed(format!("/sys/class/net/{name}/speed")).and_then(|speed| speed.parse().ok()).unwrap_or(0.0);
-            let speed_text = if speed > 0.0 { format!(", {speed:.0} Mb/s") } else { String::new() };
-            let routable = addresses.get(name).map_or_else(|| "no routable addresses".to_owned(), |list| list.join(" "));
-            tooltip.line().value(name).label(&format!(" ({}{speed_text}): ", state.to_uppercase())).value(&routable);
-            if std::path::Path::new(&format!("/sys/class/net/{name}/wireless")).exists() {
-                tooltip.line().label("  ").value(&wifi_link(name));
-            }
-            let (Some(current), Some(earlier)) = (counters.interfaces.get(name), previous.interfaces.get(name)) else { continue };
-            let change = |field: fn(&InterfaceCounters) -> u64| field(current).saturating_sub(field(earlier)) as f64 / seconds;
-            let link_bytes_per_second = speed * 125_000.0;
-            for (direction, bytes, packets, drops, errors) in [
-                ("receive", change(|c| c.receive_bytes), change(|c| c.receive_packets), change(|c| c.receive_drops), change(|c| c.receive_errors)),
-                ("send", change(|c| c.send_bytes), change(|c| c.send_packets), change(|c| c.send_drops), change(|c| c.send_errors)),
-            ] {
-                tooltip.line().label(&format!("  {direction} ")).value(&format!("{:.2} MiB/s", bytes / 1_048_576.0));
-                if link_bytes_per_second > 0.0 {
-                    let percent = 100.0 * bytes / link_bytes_per_second;
-                    tooltip.label(" (").high(percent, &format!("{percent:.0}%"), 70.0, 90.0).label(" of link)");
+        if items.interfaces {
+            tooltip.heading("Interfaces");
+            match &default_route {
+                Some((interface, gateway)) => {
+                    tooltip.line().label("Default route: ").value(interface).label(" via ").value(gateway);
                 }
-                tooltip
-                    .label(", ")
-                    .value(&format!("{packets:.0} packets/s"))
-                    .label(", ")
-                    .high(drops, &format!("{drops:.0} drops/s"), 0.01, 10.0)
-                    .label(", ")
-                    .high(errors, &format!("{errors:.0} errors/s"), 0.01, 10.0);
+                None => {
+                    tooltip.line().toned(Severity::Warning, "No default route");
+                }
             }
+            let addresses = interface_addresses();
+            let mut names: Vec<&String> = counters.interfaces.keys().collect();
+            names.sort();
+            for name in names {
+                let state = read_trimmed(format!("/sys/class/net/{name}/operstate")).unwrap_or_default();
+                if name == "lo" || state == "down" {
+                    continue;
+                }
+                let speed: f64 = read_trimmed(format!("/sys/class/net/{name}/speed")).and_then(|speed| speed.parse().ok()).unwrap_or(0.0);
+                let speed_text = if speed > 0.0 { format!(", {speed:.0} Mb/s") } else { String::new() };
+                let routable = addresses.get(name).map_or_else(|| "no routable addresses".to_owned(), |list| list.join(" "));
+                tooltip.line().value(name).label(&format!(" ({}{speed_text}): ", state.to_uppercase())).value(&routable);
+                if std::path::Path::new(&format!("/sys/class/net/{name}/wireless")).exists() {
+                    tooltip.line().label("  ").value(&wifi_link(name));
+                }
+                let (Some(current), Some(earlier)) = (counters.interfaces.get(name), previous.interfaces.get(name)) else { continue };
+                let change = |field: fn(&InterfaceCounters) -> u64| field(current).saturating_sub(field(earlier)) as f64 / seconds;
+                let link_bytes_per_second = speed * 125_000.0;
+                for (direction, bytes, packets, drops, errors) in [
+                    ("receive", change(|c| c.receive_bytes), change(|c| c.receive_packets), change(|c| c.receive_drops), change(|c| c.receive_errors)),
+                    ("send", change(|c| c.send_bytes), change(|c| c.send_packets), change(|c| c.send_drops), change(|c| c.send_errors)),
+                ] {
+                    tooltip.line().label(&format!("  {direction} ")).value(&format!("{:.2} MiB/s", bytes / 1_048_576.0));
+                    if link_bytes_per_second > 0.0 {
+                        let percent = 100.0 * bytes / link_bytes_per_second;
+                        tooltip.label(" (").high(percent, &format!("{percent:.0}%"), 70.0, 90.0).label(" of link)");
+                    }
+                    tooltip
+                        .label(", ")
+                        .value(&format!("{packets:.0} packets/s"))
+                        .label(", ")
+                        .high(drops, &format!("{drops:.0} drops/s"), 0.01, 10.0)
+                        .label(", ")
+                        .high(errors, &format!("{errors:.0} errors/s"), 0.01, 10.0);
+                }
+            }
+
         }
 
         let alt = match &default_route {

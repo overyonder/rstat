@@ -42,6 +42,9 @@
       rstat = rstat;
     });
 
+    nixosModules.default = import ./nix/nixos.nix self;
+    homeManagerModules.default = import ./nix/home-manager.nix self;
+
     devShells = forAllSystems (system: let
       pkgs = pkgsFor system;
       rustToolchain = pkgs.rust-bin.stable."1.96.0".default.override {

@@ -11,7 +11,7 @@ not how busy something is.
 
 | Section | Headline | Tooltip |
 | --- | --- | --- |
-| `cpu` | 1-minute load · CPU pressure | load, pressure, interrupt pressure, utilization, context switches, frequency scaling, fans, CPU temperature, Intel thermal-throttling events |
+| `cpu` | 1-minute load · CPU pressure | load, pressure, interrupt pressure, utilization, context switches, frequency scaling, fans, CPU temperature, Intel thermal and ACPI throttling |
 | `memory` | memory pressure (all tasks stalled) · available RAM | pressure, swap and paging, refaults, reclaim, compaction, OOM kills, RAM composition, zram, per-process proportional memory |
 | `disks` | average requests queued on local disks | per-disk busy time, queue, latency and throughput, dirty pages, root filesystem, I/O pressure, tasks blocked in D state |
 | `network` | average NAS (SMB) requests outstanding | NAS request rate and latency, TCP retransmissions and timeouts, listen and buffer errors, interfaces, link use |
@@ -109,17 +109,104 @@ The package wraps the binary so it finds the NVIDIA driver under
 `/run/opengl-driver/lib` and `iw` for Wi-Fi details. Without an NVIDIA driver
 the GPU section reports itself unavailable.
 
-## Waybar integration
+## Configuration
 
-Run the daemon as a user service:
+The daemon reads `$XDG_CONFIG_HOME/rstat/config.toml`, or the file given with
+`rstat daemon --config PATH`. Every setting is optional. Each section has an
+`enable` switch and a switch for each group of tooltip lines, all on by default.
+A switched-off group isn't sampled, and a switched-off section sends an empty
+line, which hides its Waybar module.
 
-```sh
-rstat daemon                    # samples watched sections once a second
-rstat daemon --interval-ms 500  # at least 100
+```toml
+interval_ms = 1000          # how often watched sections are sampled, at least 100
+
+[colors]                    # Pango colours
+ok = "#a6e3a1"
+warning = "#fab387"
+critical = "#f38ba8"
+label = "#7f849c"
+value = "#cdd6f4"
+heading = "#89b4fa"
+
+[cpu]                       # load, pressure, interrupt_pressure, utilization, scheduler, frequency,
+fans = false                # scaling, fans, temperature, thermal_throttling, acpi_throttling
+
+[memory]                    # pressure, paging, reclaim, ram, zram, processes
+
+[disks]                     # devices, dirty_pages, root_filesystem, pressure, blocked_tasks
+
+[network]                   # nas, retransmissions, connections, listen_queue, udp_errors,
+nas = false                 # kernel_backlog, interfaces
+
+[gpu]                       # utilization, vram, clock_limits, clocks, power, temperature, fans,
+devices = [0]               # pcie, pcie_traffic, processes; devices lists NVML indices, empty for all
+processes = false
 ```
 
-Each module runs a watcher, which exits if the daemon goes away so Waybar
-restarts it:
+The memory section's process table comes from a root sampler, run about once a
+minute:
+
+```sh
+rstat sample-process-memory /run/waybar-memory-processes.json
+```
+
+## NixOS and Home Manager
+
+The flake provides a NixOS module for the root sampler and a Home Manager module
+for the daemon, whose options mirror the configuration file
+(`programs.rstat.cpu.fans`, `programs.rstat.gpu.devices` and so on, each
+documented in `nix/sections.nix`):
+
+```nix
+# flake inputs
+rstat.url = "github:overyonder/rstat";
+
+# NixOS configuration
+imports = [inputs.rstat.nixosModules.default];
+services.rstat.processMemory.enable = true;
+
+# Home Manager configuration
+imports = [inputs.rstat.homeManagerModules.default];
+programs.rstat = {
+  enable = true;
+  gpu.enable = false;
+  network.nas = false;
+};
+programs.waybar.settings.main = {
+  modules-right = ["custom/cpu" "custom/memory" "custom/disks" "custom/network"];
+  "custom/cpu" = config.programs.rstat.waybarModules.cpu // {format = " {}";};
+  "custom/memory" = config.programs.rstat.waybarModules.memory // {format = "󰍛 {}";};
+  "custom/disks" = config.programs.rstat.waybarModules.disks // {format = "󰋊 {}";};
+  "custom/network" = config.programs.rstat.waybarModules.network // {
+    format = "{icon} {text}";
+    format-icons = {ethernet = "󰈀"; wifi = "󰤨"; disconnected = "󰤭";};
+  };
+};
+```
+
+`waybarModules` holds a definition for each enabled section: the watcher
+command, JSON output and restart interval.
+
+## Other distributions
+
+Run the daemon as a user service, `~/.config/systemd/user/rstat.service`,
+enabled with `systemctl --user enable --now rstat`:
+
+```ini
+[Unit]
+Description=rstat system monitor for Waybar
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=/usr/local/bin/rstat daemon
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target
+```
+
+Add a Waybar module per section. Each watcher exits if the daemon goes away, so
+Waybar restarts it:
 
 ```jsonc
 "custom/cpu": {
@@ -139,74 +226,6 @@ restarts it:
 
 The sections are `cpu`, `memory`, `disks`, `network` and `gpu`. The network
 section sets `alt` to `ethernet`, `wifi` or `disconnected` for format icons.
-
-Markup colours come from the daemon's environment: `COLOR_OK`, `COLOR_WARNING`,
-`COLOR_CRITICAL`, `COLOR_LABEL` (dim labels), `COLOR_VALUE` (descriptive
-figures) and `COLOR_HEADING`.
-
-For the memory section's process table, run as root about once a minute:
-
-```sh
-rstat sample-process-memory /run/waybar-memory-processes.json
-```
-
-### Example: NixOS and Home Manager
-
-```nix
-# flake.nix inputs
-rstat.url = "github:overyonder/rstat";
-
-# NixOS configuration: the root process-memory sampler.
-systemd.services.rstat-process-memory = {
-  serviceConfig = {
-    Type = "oneshot";
-    ExecStart = "${rstat}/bin/rstat sample-process-memory /run/waybar-memory-processes.json";
-    Nice = 19;
-  };
-};
-systemd.timers.rstat-process-memory = {
-  wantedBy = ["timers.target"];
-  timerConfig = { OnBootSec = "30s"; OnUnitInactiveSec = "60s"; };
-};
-
-# Home Manager configuration: the daemon and the Waybar modules.
-systemd.user.services.rstat = {
-  Unit.PartOf = ["graphical-session.target"];
-  Service = {
-    ExecStart = "${rstat}/bin/rstat daemon";
-    Restart = "on-failure";
-    Environment = ["COLOR_OK=#a6e3a1" "COLOR_WARNING=#fab387" "COLOR_CRITICAL=#f38ba8"];
-  };
-  Install.WantedBy = ["graphical-session.target"];
-};
-programs.waybar.settings.main = {
-  "custom/cpu"     = { exec = "${rstat}/bin/rstat watch cpu";     return-type = "json"; restart-interval = 5; };
-  "custom/memory"  = { exec = "${rstat}/bin/rstat watch memory";  return-type = "json"; restart-interval = 5; };
-  "custom/disks"   = { exec = "${rstat}/bin/rstat watch disks";   return-type = "json"; restart-interval = 5; };
-  "custom/network" = { exec = "${rstat}/bin/rstat watch network"; return-type = "json"; restart-interval = 5; };
-  "custom/gpu"     = { exec = "${rstat}/bin/rstat watch gpu";     return-type = "json"; restart-interval = 5; };
-};
-```
-
-Here `rstat` is `inputs.rstat.packages.${pkgs.system}.default`.
-
-### Example: other distributions
-
-`~/.config/systemd/user/rstat.service`, enabled with
-`systemctl --user enable --now rstat`:
-
-```ini
-[Unit]
-Description=rstat system monitor for Waybar
-PartOf=graphical-session.target
-
-[Service]
-ExecStart=/usr/local/bin/rstat daemon
-Restart=on-failure
-
-[Install]
-WantedBy=graphical-session.target
-```
 
 For the process table, a root cron entry is enough:
 

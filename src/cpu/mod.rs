@@ -3,6 +3,7 @@
 
 use std::time::Instant;
 
+use crate::config::CpuConfig;
 use crate::markup::{Markup, MarkupColors, Severity, WaybarReport};
 use crate::procfs_file::{ProcfsFile, parse_pressure, read_trimmed};
 
@@ -50,12 +51,14 @@ pub(crate) struct CpuSampler {
     temperatures:     Vec<CpuTemperature>,
     throttle:         ThrottleCounters,
     previous_throttle: Option<(u64, u64)>,  // Core events summed, package events at the last sample
+    acpi_cooling:     Vec<ProcfsFile>,  // cur_state of each ACPI Processor cooling device; above 0 is throttled
+    items:            CpuConfig,
     cpu_count:        f64,
     previous:         Option<(Instant, CpuCounters)>,
 }
 
 impl CpuSampler {
-    pub(crate) fn open() -> std::io::Result<Self> {
+    pub(crate) fn open(items: CpuConfig) -> std::io::Result<Self> {
         let mut current_freqs = Vec::new();
         let mut cpu_count = 0.0;
         let mut core_throttle = Vec::new();
@@ -67,17 +70,19 @@ impl CpuSampler {
                 continue;
             }
             cpu_count += 1.0;
-            core_throttle.extend(ProcfsFile::open(entry.path().join("thermal_throttle/core_throttle_count")));
-            package_throttle.extend(ProcfsFile::open(entry.path().join("thermal_throttle/package_throttle_count")));
-            if let Some(file) = ProcfsFile::open(entry.path().join("cpufreq/scaling_cur_freq")) {
-                current_freqs.push(file);
+            if items.thermal_throttling {
+                core_throttle.extend(ProcfsFile::open(entry.path().join("thermal_throttle/core_throttle_count")));
+                package_throttle.extend(ProcfsFile::open(entry.path().join("thermal_throttle/package_throttle_count")));
+            }
+            if items.frequency {
+                current_freqs.extend(ProcfsFile::open(entry.path().join("cpufreq/scaling_cur_freq")));
             }
         }
         let mut fans = Vec::new();
         let mut temperatures = Vec::new();
         for sensor in std::fs::read_dir("/sys/class/hwmon").into_iter().flatten().flatten() {
             let sensor_name = read_trimmed(sensor.path().join("name")).unwrap_or_default();
-            if CPU_TEMPERATURE_DRIVERS.contains(&sensor_name.as_str()) {
+            if items.temperature && CPU_TEMPERATURE_DRIVERS.contains(&sensor_name.as_str()) {
                 for input in std::fs::read_dir(sensor.path()).into_iter().flatten().flatten() {
                     let file_name = input.file_name().to_string_lossy().into_owned();
                     let Some(stem) = file_name.strip_suffix("_input").filter(|stem| stem.starts_with("temp")) else { continue };
@@ -89,6 +94,9 @@ impl CpuSampler {
             }
             for input in std::fs::read_dir(sensor.path()).into_iter().flatten().flatten() {
                 let file_name = input.file_name().to_string_lossy().into_owned();
+                if !items.fans {
+                    break;
+                }
                 let Some(stem) = file_name.strip_prefix("fan").and_then(|rest| rest.strip_suffix("_input")) else { continue };
                 let label = read_trimmed(sensor.path().join(format!("fan{stem}_label"))).unwrap_or_else(|| format!("fan{stem}"));
                 if let Some(speed) = ProcfsFile::open(input.path()) {
@@ -96,6 +104,17 @@ impl CpuSampler {
                 }
             }
         }
+        let acpi_cooling = if items.acpi_throttling {
+            std::fs::read_dir("/sys/class/thermal")
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|device| read_trimmed(device.path().join("type")).as_deref() == Some("Processor"))
+                .filter_map(|device| ProcfsFile::open(device.path().join("cur_state")))
+                .collect()
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             stat: ProcfsFile::open("/proc/stat").ok_or_else(|| std::io::Error::other("cannot open /proc/stat"))?,
             loadavg: ProcfsFile::open("/proc/loadavg").ok_or_else(|| std::io::Error::other("cannot open /proc/loadavg"))?,
@@ -106,6 +125,8 @@ impl CpuSampler {
             temperatures,
             throttle: ThrottleCounters { core: core_throttle, package: package_throttle },
             previous_throttle: None,
+            acpi_cooling,
+            items,
             cpu_count,
             previous: None,
         })
@@ -124,31 +145,40 @@ impl CpuSampler {
         let (cpu_some, _) = parse_pressure(self.cpu_pressure.read());
         let cpus = self.cpu_count;
 
+        let items = self.items;
         let mut tooltip = Markup::new(colors);
-        tooltip.heading("Load").line().label("1 / 5 / 15 min: ");
-        for (index, load) in [load_one_minute, load_five_minutes, load_fifteen_minutes].into_iter().enumerate() {
-            if index > 0 {
-                tooltip.label(" / ");
+        if items.load {
+            tooltip.heading("Load").line().label("1 / 5 / 15 min: ");
+            for (index, load) in [load_one_minute, load_five_minutes, load_fifteen_minutes].into_iter().enumerate() {
+                if index > 0 {
+                    tooltip.label(" / ");
+                }
+                tooltip.high(load, &format!("{load:.2}"), cpus, 2.0 * cpus);
             }
-            tooltip.high(load, &format!("{load:.2}"), cpus, 2.0 * cpus);
+            tooltip
+                .label(" · per CPU: ")
+                .high(load_one_minute / cpus, &format!("{:.2}", load_one_minute / cpus), 1.0, 2.0)
+                .label(" over ")
+                .value(&format!("{cpus:.0}"))
+                .label(" CPUs");
+            tooltip
+                .line()
+                .label("Runnable: ")
+                .value(&running.to_string())
+                .label(" · blocked in D state: ")
+                .high(blocked as f64, &blocked.to_string(), 4.0, 16.0);
+            tooltip.line().label("Load counts tasks waiting on local disks and on the NAS; the disk and network sections separate them.");
         }
-        tooltip
-            .label(" · per CPU: ")
-            .high(load_one_minute / cpus, &format!("{:.2}", load_one_minute / cpus), 1.0, 2.0)
-            .label(" over ")
-            .value(&format!("{cpus:.0}"))
-            .label(" CPUs");
-        tooltip
-            .line()
-            .label("Runnable: ")
-            .value(&running.to_string())
-            .label(" · blocked in D state: ")
-            .high(blocked as f64, &blocked.to_string(), 4.0, 16.0);
-        tooltip.line().label("Load counts tasks waiting on local disks and on the NAS; the disk and network sections separate them.");
 
-        tooltip.heading("Pressure, some tasks waiting (10s / 60s / 300s)").line().label("CPU: ");
-        write_pressure_triple(&mut tooltip, cpu_some, 10.0, 40.0);
-        if let Some(irq_pressure) = &mut self.irq_pressure {
+        let irq_pressure = self.irq_pressure.as_mut().filter(|_| items.interrupt_pressure);
+        if items.pressure || irq_pressure.is_some() {
+            tooltip.heading("Pressure, some tasks waiting (10s / 60s / 300s)");
+        }
+        if items.pressure {
+            tooltip.line().label("CPU: ");
+            write_pressure_triple(&mut tooltip, cpu_some, 10.0, 40.0);
+        }
+        if let Some(irq_pressure) = irq_pressure {
             let (_, irq_full) = parse_pressure(irq_pressure.read());
             tooltip.line().label("Time lost to interrupts: ");
             write_pressure_triple(&mut tooltip, irq_full, 5.0, 20.0);
@@ -164,29 +194,37 @@ impl CpuSampler {
         let total = (user + system + idle + iowait + interrupts + steal).max(1.0);
         let percent = |part: f64| 100.0 * part / total;
         let busy = percent(total - idle - iowait);
-        tooltip
-            .heading("Utilization")
-            .line()
-            .label("Busy: ")
-            .high(busy, &format!("{busy:.1}%"), 80.0, 95.0)
-            .label(" · user ")
-            .value(&format!("{:.1}", percent(user)))
-            .label(" · system ")
-            .value(&format!("{:.1}", percent(system)))
-            .label(" · interrupts ")
-            .value(&format!("{:.1}", percent(interrupts)))
-            .label(" · I/O wait ")
-            .high(percent(iowait), &format!("{:.1}", percent(iowait)), 10.0, 30.0)
-            .label(" · steal ")
-            .high(percent(steal), &format!("{:.1}", percent(steal)), 5.0, 20.0);
-        tooltip
-            .line()
-            .label("Context switches: ")
-            .value(&format!("{:.0}/s", delta(counters.context_switches, previous.context_switches) / seconds))
-            .label(" · forks: ")
-            .value(&format!("{:.0}/s", delta(counters.forks, previous.forks) / seconds));
+        if items.utilization || items.scheduler {
+            tooltip.heading("Utilization");
+        }
+        if items.utilization {
+            tooltip
+                .line()
+                .label("Busy: ")
+                .high(busy, &format!("{busy:.1}%"), 80.0, 95.0)
+                .label(" · user ")
+                .value(&format!("{:.1}", percent(user)))
+                .label(" · system ")
+                .value(&format!("{:.1}", percent(system)))
+                .label(" · interrupts ")
+                .value(&format!("{:.1}", percent(interrupts)))
+                .label(" · I/O wait ")
+                .high(percent(iowait), &format!("{:.1}", percent(iowait)), 10.0, 30.0)
+                .label(" · steal ")
+                .high(percent(steal), &format!("{:.1}", percent(steal)), 5.0, 20.0);
+        }
+        if items.scheduler {
+            tooltip
+                .line()
+                .label("Context switches: ")
+                .value(&format!("{:.0}/s", delta(counters.context_switches, previous.context_switches) / seconds))
+                .label(" · forks: ")
+                .value(&format!("{:.0}/s", delta(counters.forks, previous.forks) / seconds));
+        }
 
-        tooltip.heading("Frequency and cooling");
+        if items.frequency || items.scaling || items.fans || items.temperature || items.thermal_throttling || items.acpi_throttling {
+            tooltip.heading("Frequency and cooling");
+        }
         let freqs: Vec<f64> = self.current_freqs.iter_mut().filter_map(ProcfsFile::read_value::<f64>).map(|khz| khz / 1e6).collect();
         if !freqs.is_empty() {
             let average = freqs.iter().sum::<f64>() / freqs.len() as f64;
@@ -197,10 +235,12 @@ impl CpuSampler {
                 .label("Reported: ")
                 .value(&format!("{average:.2} GHz average, {minimum:.2}–{maximum:.2} GHz across threads"));
         }
-        for line in cpu_scaling_lines() {
-            tooltip.field(&line);
+        if items.scaling {
+            for line in cpu_scaling_lines() {
+                tooltip.field(&line);
+            }
         }
-        if self.fans.is_empty() {
+        if items.fans && self.fans.is_empty() {
             tooltip.field("Fans: not exposed by hardware sensors");
         }
         for fan in &mut self.fans {
@@ -243,6 +283,16 @@ impl CpuSampler {
             .high(load_one_minute, &format!("{load_one_minute:.2}"), cpus, 2.0 * cpus)
             .label(" · ")
             .high(cpu_some.ten_seconds, &format!("{:.1}%", cpu_some.ten_seconds), 10.0, 40.0);
+        if !self.acpi_cooling.is_empty() {
+            let throttled = self.acpi_cooling.iter_mut().filter_map(ProcfsFile::read_value::<u64>).filter(|state| *state > 0).count();
+            thermal_severity = thermal_severity.max(Severity::of_high(throttled as f64, 1.0, 1.0));
+            tooltip
+                .line()
+                .label("ACPI processor throttling: ")
+                .high(throttled as f64, &throttled.to_string(), 1.0, 1.0)
+                .label(&format!(" of {} CPUs throttled", self.acpi_cooling.len()));
+        }
+
         let severity = headline.worst_severity().max(thermal_severity.min(Severity::Warning));
         WaybarReport::new(headline.into_text(), tooltip.into_text(), severity)
     }

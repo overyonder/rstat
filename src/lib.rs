@@ -7,6 +7,7 @@ pub mod process_memory;
 pub mod section;
 pub mod watch;
 
+mod config;
 mod cpu;
 mod disks;
 mod gpu;

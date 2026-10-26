@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
+use crate::config::DisksConfig;
 use crate::markup::{Markup, MarkupColors, Severity, WaybarReport};
 use crate::procfs_file::{ProcfsFile, keyed_value, parse_pressure};
 
@@ -32,10 +33,11 @@ pub(crate) struct DisksSampler {
     stat:     ProcfsFile,
     pressure: ProcfsFile,
     previous: Option<(Instant, Vec<DiskCounters>)>,
+    items:    DisksConfig,
 }
 
 impl DisksSampler {
-    pub(crate) fn open() -> std::io::Result<Self> {
+    pub(crate) fn open(items: DisksConfig) -> std::io::Result<Self> {
         let open = |path: &str| ProcfsFile::open(path).ok_or_else(|| std::io::Error::other(format!("cannot open {path}")));
         // Physical disks only: partitions, device-mapper, loop and zram devices would double count.
         let mut disks: Vec<Disk> = std::fs::read_dir("/sys/block")?
@@ -47,7 +49,7 @@ impl DisksSampler {
             })
             .collect();
         disks.sort_by(|left, right| left.name.cmp(&right.name));
-        Ok(Self { disks, meminfo: open("/proc/meminfo")?, stat: open("/proc/stat")?, pressure: open("/proc/pressure/io")?, previous: None })
+        Ok(Self { disks, meminfo: open("/proc/meminfo")?, stat: open("/proc/stat")?, pressure: open("/proc/pressure/io")?, previous: None, items })
     }
 
     pub(crate) fn sample(&mut self, colors: &MarkupColors) -> WaybarReport {
@@ -58,14 +60,20 @@ impl DisksSampler {
         };
         let seconds = now.duration_since(previous_time).as_secs_f64();
 
+        let items = self.items;
         let mut tooltip = Markup::new(colors);
-        tooltip.heading("Local disks");
+        if items.devices || items.dirty_pages || items.root_filesystem {
+            tooltip.heading("Local disks");
+        }
         let mut total_queue = 0.0;
         for ((disk, current), earlier) in self.disks.iter().zip(&counters).zip(&previous) {
             let delta = |field: fn(&DiskCounters) -> u64| field(current).saturating_sub(field(earlier)) as f64;
             let busy = (delta(|counters| counters.busy_milliseconds) / (seconds * 10.0)).min(100.0);
             let queue = delta(|counters| counters.weighted_milliseconds) / (seconds * 1000.0);
             total_queue += queue;
+            if !items.devices {
+                continue;
+            }
             let (reads, writes) = (delta(|counters| counters.reads), delta(|counters| counters.writes));
             let read_wait = if reads > 0.0 { delta(|counters| counters.read_milliseconds) / reads } else { 0.0 };
             let write_wait = if writes > 0.0 { delta(|counters| counters.write_milliseconds) / writes } else { 0.0 };
@@ -91,15 +99,17 @@ impl DisksSampler {
                 .label(", wait ")
                 .high(write_wait, &format!("{write_wait:.2} ms"), 20.0, 100.0);
         }
-        let meminfo = self.meminfo.read();
-        tooltip
-            .line()
-            .label("Dirty pages: ")
-            .value(&format!("{:.1} MiB", keyed_value(meminfo, "Dirty") as f64 / 1024.0))
-            .label(" · under writeback: ")
-            .value(&format!("{:.1} MiB", keyed_value(meminfo, "Writeback") as f64 / 1024.0));
+        if items.dirty_pages {
+            let meminfo = self.meminfo.read();
+            tooltip
+                .line()
+                .label("Dirty pages: ")
+                .value(&format!("{:.1} MiB", keyed_value(meminfo, "Dirty") as f64 / 1024.0))
+                .label(" · under writeback: ")
+                .value(&format!("{:.1} MiB", keyed_value(meminfo, "Writeback") as f64 / 1024.0));
+        }
         let mut root_percent = 0.0;
-        if let Ok(root) = nix::sys::statvfs::statvfs("/") {
+        if let Some(root) = nix::sys::statvfs::statvfs("/").ok().filter(|_| items.root_filesystem) {
             let fragment = root.fragment_size() as f64;
             let size = root.blocks() as f64 * fragment;
             let free = root.blocks_free() as f64 * fragment;
@@ -119,30 +129,36 @@ impl DisksSampler {
                 .label(" free");
         }
 
-        let (some, full) = parse_pressure(self.pressure.read());
-        tooltip.heading("I/O pressure, local disks and NAS together (10s / 60s / 300s)");
-        tooltip
-            .line()
-            .label("Some tasks stalled: ")
-            .high(some.ten_seconds, &format!("{:.2}", some.ten_seconds), 10.0, 40.0)
-            .label(" / ")
-            .high(some.one_minute, &format!("{:.2}", some.one_minute), 10.0, 40.0)
-            .label(" / ")
-            .high(some.five_minutes, &format!("{:.2}%", some.five_minutes), 10.0, 40.0);
-        tooltip
-            .line()
-            .label("All tasks stalled: ")
-            .high(full.ten_seconds, &format!("{:.2}", full.ten_seconds), 2.0, 10.0)
-            .label(" / ")
-            .high(full.one_minute, &format!("{:.2}", full.one_minute), 2.0, 10.0)
-            .label(" / ")
-            .high(full.five_minutes, &format!("{:.2}%", full.five_minutes), 2.0, 10.0);
-        let blocked = keyed_value(self.stat.read(), "procs_blocked");
-        tooltip.line().label("Blocked in D state: ").high(blocked as f64, &blocked.to_string(), 4.0, 16.0);
-        // Scanning every thread costs about 100 ms, so it runs only while the kernel reports blocked tasks.
-        if blocked > 0 {
-            for (count, name) in blocked_threads_by_command() {
-                tooltip.line().label("  ").high(count as f64, &format!("{count:5}"), 4.0, 16.0).label("  ").value(&name);
+        if items.pressure || items.blocked_tasks {
+            tooltip.heading("I/O pressure, local disks and NAS together (10s / 60s / 300s)");
+        }
+        if items.pressure {
+            let (some, full) = parse_pressure(self.pressure.read());
+            tooltip
+                .line()
+                .label("Some tasks stalled: ")
+                .high(some.ten_seconds, &format!("{:.2}", some.ten_seconds), 10.0, 40.0)
+                .label(" / ")
+                .high(some.one_minute, &format!("{:.2}", some.one_minute), 10.0, 40.0)
+                .label(" / ")
+                .high(some.five_minutes, &format!("{:.2}%", some.five_minutes), 10.0, 40.0);
+            tooltip
+                .line()
+                .label("All tasks stalled: ")
+                .high(full.ten_seconds, &format!("{:.2}", full.ten_seconds), 2.0, 10.0)
+                .label(" / ")
+                .high(full.one_minute, &format!("{:.2}", full.one_minute), 2.0, 10.0)
+                .label(" / ")
+                .high(full.five_minutes, &format!("{:.2}%", full.five_minutes), 2.0, 10.0);
+        }
+        if items.blocked_tasks {
+            let blocked = keyed_value(self.stat.read(), "procs_blocked");
+            tooltip.line().label("Blocked in D state: ").high(blocked as f64, &blocked.to_string(), 4.0, 16.0);
+            // Scanning every thread costs about 100 ms, so it runs only while the kernel reports blocked tasks.
+            if blocked > 0 {
+                for (count, name) in blocked_threads_by_command() {
+                    tooltip.line().label("  ").high(count as f64, &format!("{count:5}"), 4.0, 16.0).label("  ").value(&name);
+                }
             }
         }
 

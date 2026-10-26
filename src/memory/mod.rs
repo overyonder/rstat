@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use crate::config::MemoryConfig;
 use crate::markup::{Markup, MarkupColors, Severity, WaybarReport};
 use crate::procfs_file::{ProcfsFile, keyed_value, parse_pressure};
 
@@ -21,18 +22,23 @@ pub(crate) struct MemorySampler {
     zram:      Vec<ProcfsFile>,  // mm_stat per zram device, in bytes
     page_size: f64,
     previous:  Option<(Instant, HashMap<String, u64>)>,
+    items:     MemoryConfig,
 }
 
 impl MemorySampler {
-    pub(crate) fn open() -> std::io::Result<Self> {
+    pub(crate) fn open(items: MemoryConfig) -> std::io::Result<Self> {
         let open = |path: &str| ProcfsFile::open(path).ok_or_else(|| std::io::Error::other(format!("cannot open {path}")));
-        let zram = std::fs::read_dir("/sys/block")
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|entry| entry.file_name().to_string_lossy().starts_with("zram"))
-            .filter_map(|entry| ProcfsFile::open(entry.path().join("mm_stat")))
-            .collect();
+        let zram = if items.zram {
+            std::fs::read_dir("/sys/block")
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("zram"))
+                .filter_map(|entry| ProcfsFile::open(entry.path().join("mm_stat")))
+                .collect()
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             meminfo:   open("/proc/meminfo")?,
             vmstat:    open("/proc/vmstat")?,
@@ -40,6 +46,7 @@ impl MemorySampler {
             zram,
             page_size: nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE).ok().flatten().unwrap_or(4096) as f64,
             previous:  None,
+            items,
         })
     }
 
@@ -79,24 +86,28 @@ impl MemorySampler {
         let available_percent = if total > 0.0 { 100.0 * available / total } else { 0.0 };
         let oom_kills = delta("oom_kill");
 
+        let items = self.items;
         let mut tooltip = Markup::new(colors);
-        tooltip.heading("Pressure (10s / 60s / 300s)");
-        tooltip
-            .line()
-            .label("Some tasks stalled: ")
-            .high(some.ten_seconds, &format!("{:.2}", some.ten_seconds), 10.0, 40.0)
-            .label(" / ")
-            .high(some.one_minute, &format!("{:.2}", some.one_minute), 10.0, 40.0)
-            .label(" / ")
-            .high(some.five_minutes, &format!("{:.2}%", some.five_minutes), 10.0, 40.0);
-        tooltip
-            .line()
-            .label("All tasks stalled: ")
-            .high(full.ten_seconds, &format!("{:.2}", full.ten_seconds), 2.0, 10.0)
-            .label(" / ")
-            .high(full.one_minute, &format!("{:.2}", full.one_minute), 2.0, 10.0)
-            .label(" / ")
-            .high(full.five_minutes, &format!("{:.2}%", full.five_minutes), 2.0, 10.0);
+        if items.pressure {
+            tooltip.heading("Pressure (10s / 60s / 300s)");
+            tooltip
+                .line()
+                .label("Some tasks stalled: ")
+                .high(some.ten_seconds, &format!("{:.2}", some.ten_seconds), 10.0, 40.0)
+                .label(" / ")
+                .high(some.one_minute, &format!("{:.2}", some.one_minute), 10.0, 40.0)
+                .label(" / ")
+                .high(some.five_minutes, &format!("{:.2}%", some.five_minutes), 10.0, 40.0);
+            tooltip
+                .line()
+                .label("All tasks stalled: ")
+                .high(full.ten_seconds, &format!("{:.2}", full.ten_seconds), 2.0, 10.0)
+                .label(" / ")
+                .high(full.one_minute, &format!("{:.2}", full.one_minute), 2.0, 10.0)
+                .label(" / ")
+                .high(full.five_minutes, &format!("{:.2}%", full.five_minutes), 2.0, 10.0);
+
+        }
 
         let swap_in = per_second("pswpin") * self.page_size / MIB;
         let swap_out = per_second("pswpout") * self.page_size / MIB;
@@ -104,84 +115,98 @@ impl MemorySampler {
         let refault_file = per_second("workingset_refault_file");
         let major_faults = per_second("pgmajfault");
         let compaction_stalls = per_second("compact_stall");
-        tooltip.heading("Paging and reclaim");
-        tooltip
-            .line()
-            .label("Swap-in: ")
-            .high(swap_in, &format!("{swap_in:.2} MiB/s"), 1.0, 20.0)
-            .label(" · swap-out: ")
-            .high(swap_out, &format!("{swap_out:.2} MiB/s"), 1.0, 20.0);
-        tooltip.line().label("Major page faults: ").high(major_faults, &format!("{major_faults:.0}/s"), 500.0, 5000.0);
-        tooltip
-            .line()
-            .label("Refaults of evicted pages: anonymous ")
-            .high(refault_anonymous, &format!("{refault_anonymous:.0}/s"), 1000.0, 10000.0)
-            .label(", file ")
-            .high(refault_file, &format!("{refault_file:.0}/s"), 1000.0, 10000.0);
-        tooltip
-            .line()
-            .label("Direct reclaim: ")
-            .high(allocation_stalls, &format!("{allocation_stalls:.1} stalls/s"), 1.0, 10.0)
-            .label(", ")
-            .value(&format!("{:.0} pages scanned/s", per_second("pgscan_direct")))
-            .label(" · background (kswapd): ")
-            .value(&format!("{:.0} pages scanned/s", per_second("pgscan_kswapd")));
-        tooltip.line().label("Compaction stalls: ").high(compaction_stalls, &format!("{compaction_stalls:.1}/s"), 1.0, 10.0);
-        tooltip
-            .line()
-            .label("OOM kills: ")
-            .high(oom_kills, &format!("{oom_kills:.0}"), 1.0, 1.0)
-            .label(&format!(" in the last {seconds:.0}s, "))
-            .value(&counters.get("oom_kill").copied().unwrap_or(0).to_string())
-            .label(" since boot");
+        if items.paging || items.reclaim {
+            tooltip.heading("Paging and reclaim");
+        }
+        if items.paging {
+            tooltip
+                .line()
+                .label("Swap-in: ")
+                .high(swap_in, &format!("{swap_in:.2} MiB/s"), 1.0, 20.0)
+                .label(" · swap-out: ")
+                .high(swap_out, &format!("{swap_out:.2} MiB/s"), 1.0, 20.0);
+            tooltip.line().label("Major page faults: ").high(major_faults, &format!("{major_faults:.0}/s"), 500.0, 5000.0);
+            tooltip
+                .line()
+                .label("Refaults of evicted pages: anonymous ")
+                .high(refault_anonymous, &format!("{refault_anonymous:.0}/s"), 1000.0, 10000.0)
+                .label(", file ")
+                .high(refault_file, &format!("{refault_file:.0}/s"), 1000.0, 10000.0);
+        }
+        if items.reclaim {
+            tooltip
+                .line()
+                .label("Direct reclaim: ")
+                .high(allocation_stalls, &format!("{allocation_stalls:.1} stalls/s"), 1.0, 10.0)
+                .label(", ")
+                .value(&format!("{:.0} pages scanned/s", per_second("pgscan_direct")))
+                .label(" · background (kswapd): ")
+                .value(&format!("{:.0} pages scanned/s", per_second("pgscan_kswapd")));
+            tooltip.line().label("Compaction stalls: ").high(compaction_stalls, &format!("{compaction_stalls:.1}/s"), 1.0, 10.0);
+            tooltip
+                .line()
+                .label("OOM kills: ")
+                .high(oom_kills, &format!("{oom_kills:.0}"), 1.0, 1.0)
+                .label(&format!(" in the last {seconds:.0}s, "))
+                .value(&counters.get("oom_kill").copied().unwrap_or(0).to_string())
+                .label(" since boot");
+        }
 
         let outside_zram = total - bytes("MemFree") - zram_physical;
         let cache = bytes("Cached") + bytes("Buffers");
         let kernel_other = bytes("PageTables") + bytes("SecPageTables") + bytes("KernelStack") + bytes("Percpu");
         let other = outside_zram - bytes("AnonPages") - cache - bytes("Slab") - kernel_other - bytes("SwapCached");
-        tooltip.heading("RAM");
-        tooltip
-            .line()
-            .label("Available (includes reclaimable): ")
-            .low(available / GIB, &format!("{:.2} GiB", available / GIB), total * 0.15 / GIB, total * 0.05 / GIB)
-            .label(" of ")
-            .value(&format!("{:.2} GiB", total / GIB))
-            .label(" (")
-            .low(available_percent, &format!("{available_percent:.0}%"), 15.0, 5.0)
-            .label(")");
-        tooltip
-            .line()
-            .label("Free physical: ")
-            .value(&format!("{:.2} GiB", bytes("MemFree") / GIB))
-            .label(" · swap used: ")
-            .value(&format!("{:.2} of {:.2} GiB", (bytes("SwapTotal") - bytes("SwapFree")) / GIB, bytes("SwapTotal") / GIB));
-        tooltip.line().label("In use outside zram: ").value(&format!("{:.2} GiB", outside_zram / GIB));
-        tooltip
-            .line()
-            .label("  anonymous ")
-            .value(&format!("{:.2}", bytes("AnonPages") / GIB))
-            .label(" · file cache and shared ")
-            .value(&format!("{:.2}", cache / GIB))
-            .label(" · slab ")
-            .value(&format!("{:.2}", bytes("Slab") / GIB))
-            .label(" · page tables, stacks, per-CPU ")
-            .value(&format!("{:.2}", kernel_other / GIB))
-            .label(" · swap cache ")
-            .value(&format!("{:.2}", bytes("SwapCached") / GIB))
-            .label(" · other ")
-            .value(&format!("{:.2} GiB", other / GIB));
-        tooltip
-            .line()
-            .label("Zram: ")
-            .value(&format!("{:.2} GiB", zram_logical / GIB))
-            .label(" stored in ")
-            .value(&format!("{:.2} GiB", zram_physical / GIB))
-            .label(" (payload ")
-            .value(&format!("{:.2}", zram_payload / GIB))
-            .label(", allocator overhead ")
-            .value(&format!("{:.2} GiB", (zram_physical - zram_payload) / GIB))
-            .label(")");
-        write_process_memory_rows(&mut tooltip);
+        if items.ram || items.zram {
+            tooltip.heading("RAM");
+        }
+        if items.ram {
+            tooltip
+                .line()
+                .label("Available (includes reclaimable): ")
+                .low(available / GIB, &format!("{:.2} GiB", available / GIB), total * 0.15 / GIB, total * 0.05 / GIB)
+                .label(" of ")
+                .value(&format!("{:.2} GiB", total / GIB))
+                .label(" (")
+                .low(available_percent, &format!("{available_percent:.0}%"), 15.0, 5.0)
+                .label(")");
+            tooltip
+                .line()
+                .label("Free physical: ")
+                .value(&format!("{:.2} GiB", bytes("MemFree") / GIB))
+                .label(" · swap used: ")
+                .value(&format!("{:.2} of {:.2} GiB", (bytes("SwapTotal") - bytes("SwapFree")) / GIB, bytes("SwapTotal") / GIB));
+            tooltip.line().label("In use outside zram: ").value(&format!("{:.2} GiB", outside_zram / GIB));
+            tooltip
+                .line()
+                .label("  anonymous ")
+                .value(&format!("{:.2}", bytes("AnonPages") / GIB))
+                .label(" · file cache and shared ")
+                .value(&format!("{:.2}", cache / GIB))
+                .label(" · slab ")
+                .value(&format!("{:.2}", bytes("Slab") / GIB))
+                .label(" · page tables, stacks, per-CPU ")
+                .value(&format!("{:.2}", kernel_other / GIB))
+                .label(" · swap cache ")
+                .value(&format!("{:.2}", bytes("SwapCached") / GIB))
+                .label(" · other ")
+                .value(&format!("{:.2} GiB", other / GIB));
+        }
+        if items.zram {
+            tooltip
+                .line()
+                .label("Zram: ")
+                .value(&format!("{:.2} GiB", zram_logical / GIB))
+                .label(" stored in ")
+                .value(&format!("{:.2} GiB", zram_physical / GIB))
+                .label(" (payload ")
+                .value(&format!("{:.2}", zram_payload / GIB))
+                .label(", allocator overhead ")
+                .value(&format!("{:.2} GiB", (zram_physical - zram_payload) / GIB))
+                .label(")");
+        }
+        if items.processes {
+            write_process_memory_rows(&mut tooltip);
+        }
 
         let mut headline = Markup::new(colors);
         headline

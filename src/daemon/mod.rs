@@ -8,8 +8,10 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Condvar, Mutex};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
+use crate::config::Config;
 use crate::cpu::CpuSampler;
 use crate::disks::DisksSampler;
 use crate::gpu::GpuSampler;
@@ -17,8 +19,6 @@ use crate::markup::{MarkupColors, WaybarReport};
 use crate::memory::MemorySampler;
 use crate::network::NetworkSampler;
 use crate::section::{Section, daemon_socket_path};
-
-pub const DEFAULT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
 struct Watcher {
     id:     u64,
@@ -58,7 +58,7 @@ struct Samplers {
 }
 
 impl Samplers {
-    fn sample(&mut self, section: Section, colors: &MarkupColors) -> WaybarReport {
+    fn sample(&mut self, section: Section, config: &Config, colors: &MarkupColors) -> WaybarReport {
         fn sample_with<S>(slot: &mut Option<S>, open: impl FnOnce() -> std::io::Result<S>, sample: impl FnOnce(&mut S) -> WaybarReport) -> WaybarReport {
             if slot.is_none() {
                 match open() {
@@ -69,11 +69,11 @@ impl Samplers {
             slot.as_mut().map_or_else(|| WaybarReport::unavailable("sampler missing"), sample)
         }
         match section {
-            Section::Cpu => sample_with(&mut self.cpu, CpuSampler::open, |sampler| sampler.sample(colors)),
-            Section::Memory => sample_with(&mut self.memory, MemorySampler::open, |sampler| sampler.sample(colors)),
-            Section::Disks => sample_with(&mut self.disks, DisksSampler::open, |sampler| sampler.sample(colors)),
-            Section::Network => sample_with(&mut self.network, NetworkSampler::open, |sampler| sampler.sample(colors)),
-            Section::Gpu => sample_with(&mut self.gpu, || Ok(GpuSampler::open()), |sampler| sampler.sample(colors)),
+            Section::Cpu => sample_with(&mut self.cpu, || CpuSampler::open(config.cpu), |sampler| sampler.sample(colors)),
+            Section::Memory => sample_with(&mut self.memory, || MemorySampler::open(config.memory), |sampler| sampler.sample(colors)),
+            Section::Disks => sample_with(&mut self.disks, || DisksSampler::open(config.disks), |sampler| sampler.sample(colors)),
+            Section::Network => sample_with(&mut self.network, || NetworkSampler::open(config.network), |sampler| sampler.sample(colors)),
+            Section::Gpu => sample_with(&mut self.gpu, || Ok(GpuSampler::open(config.gpu.clone())), |sampler| sampler.sample(colors)),
         }
     }
 
@@ -97,12 +97,15 @@ impl Samplers {
     }
 }
 
-/// Runs until the process is stopped.
+/// Runs until the process is stopped, with the configuration at `config_path`, or the default one.
 ///
 /// # Errors
 ///
-/// Fails if another daemon already listens on the socket, or the socket can't be bound.
-pub fn serve_sections_to_watchers(interval: Duration) -> Result<(), Box<dyn std::error::Error>> {
+/// Fails if the configuration is invalid, another daemon already listens on the socket, or the socket
+/// can't be bound.
+pub fn serve_sections_to_watchers(config_path: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
+    let config = Arc::new(Config::load(config_path)?);
+    let interval = Duration::from_millis(config.interval_ms.max(100));
     let path = daemon_socket_path();
     if UnixStream::connect(&path).is_ok() {
         return Err(format!("another rstat daemon is already listening on {}", path.display()).into());
@@ -112,15 +115,17 @@ pub fn serve_sections_to_watchers(interval: Duration) -> Result<(), Box<dyn std:
     let shared = Arc::new((Mutex::new(Subscriptions::default()), Condvar::new()));
     {
         let shared = Arc::clone(&shared);
+        let config_for_watchers = Arc::clone(&config);
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let shared = Arc::clone(&shared);
-                std::thread::spawn(move || serve_watcher(stream, &shared));
+                let config = Arc::clone(&config_for_watchers);
+                std::thread::spawn(move || serve_watcher(stream, &shared, &config));
             }
         });
     }
 
-    let colors = MarkupColors::from_environment();
+    let colors = MarkupColors::from_config(&config.colors);
     let mut samplers = Samplers::default();
     let (subscriptions, changed) = &*shared;
     let mut next_sample = Instant::now();
@@ -145,7 +150,7 @@ pub fn serve_sections_to_watchers(interval: Duration) -> Result<(), Box<dyn std:
         };
         next_sample = Instant::now() + interval;
         samplers.close_unwatched(&watched);
-        let lines: Vec<(Section, String)> = watched.iter().map(|section| (*section, samplers.sample(*section, &colors).to_json_line())).collect();
+        let lines: Vec<(Section, String)> = watched.iter().map(|section| (*section, samplers.sample(*section, &config, &colors).to_json_line())).collect();
 
         let mut state = subscriptions.lock().map_err(|_| "subscription lock poisoned")?;
         for (section, line) in lines {
@@ -160,7 +165,7 @@ pub fn serve_sections_to_watchers(interval: Duration) -> Result<(), Box<dyn std:
 }
 
 /// Reads the watcher's section, registers it, and holds the connection until the watcher closes it.
-fn serve_watcher(stream: UnixStream, shared: &(Mutex<Subscriptions>, Condvar)) {
+fn serve_watcher(stream: UnixStream, shared: &(Mutex<Subscriptions>, Condvar), config: &Config) {
     let Ok(reader_stream) = stream.try_clone() else { return };
     let mut reader = BufReader::new(reader_stream);
     let mut request = String::new();
@@ -171,6 +176,13 @@ fn serve_watcher(stream: UnixStream, shared: &(Mutex<Subscriptions>, Condvar)) {
         let _ = (&stream).write_all(b"{\"text\":\"?\",\"tooltip\":\"rstat: unknown section\",\"class\":\"critical\"}\n");
         return;
     };
+    // A disabled section gets one empty line, which hides its Waybar module, and is never sampled.
+    if !config.serves(section) {
+        if (&stream).write_all(b"{\"text\":\"\"}\n").is_ok() {
+            wait_for_end_of_stream(&mut reader);
+        }
+        return;
+    }
     let (subscriptions, changed) = shared;
     let id = {
         let Ok(mut state) = subscriptions.lock() else { return };
@@ -187,13 +199,18 @@ fn serve_watcher(stream: UnixStream, shared: &(Mutex<Subscriptions>, Condvar)) {
     };
     changed.notify_one();
     // A watcher sends nothing more; end of stream means it has gone, and its section may stop sampling.
-    let mut rest = String::new();
-    while matches!(reader.read_line(&mut rest), Ok(read) if read > 0) {
-        rest.clear();
-    }
+    wait_for_end_of_stream(&mut reader);
     if let Ok(mut state) = subscriptions.lock()
         && let Some(list) = state.watchers.get_mut(&section)
     {
         list.retain(|watcher| watcher.id != id);
+    }
+}
+
+/// Blocks until the watcher closes its connection; a watcher sends nothing after its request.
+fn wait_for_end_of_stream(reader: &mut BufReader<UnixStream>) {
+    let mut rest = String::new();
+    while matches!(reader.read_line(&mut rest), Ok(read) if read > 0) {
+        rest.clear();
     }
 }

@@ -1,9 +1,8 @@
 //! Waybar output: Pango markup for headlines and tooltips, and the JSON line Waybar reads.
 //!
 //! Headings are bold and underlined, labels dim, figures that can show strain green, amber or red
-//! against their thresholds, and descriptive figures plain. Colours come from the environment
-//! (`COLOR_OK`, `COLOR_WARNING`, `COLOR_CRITICAL`, `COLOR_LABEL`, `COLOR_VALUE`, `COLOR_HEADING`), so the
-//! packaging can match the desktop theme.
+//! against their thresholds, and descriptive figures plain. Colours come from the configuration, so
+//! they can match the desktop theme.
 
 use std::fmt::Write;
 
@@ -57,15 +56,14 @@ pub(crate) struct MarkupColors {
 }
 
 impl MarkupColors {
-    pub(crate) fn from_environment() -> Self {
-        let color = |name: &str, fallback: &str| std::env::var(name).unwrap_or_else(|_| fallback.to_owned());
+    pub(crate) fn from_config(colors: &crate::config::ColorConfig) -> Self {
         Self {
-            ok:       color("COLOR_OK", "#a6e3a1"),
-            warning:  color("COLOR_WARNING", "#fab387"),
-            critical: color("COLOR_CRITICAL", "#f38ba8"),
-            label:    color("COLOR_LABEL", "#7f849c"),
-            value:    color("COLOR_VALUE", "#cdd6f4"),
-            heading:  color("COLOR_HEADING", "#89b4fa"),
+            ok:       colors.ok.clone(),
+            warning:  colors.warning.clone(),
+            critical: colors.critical.clone(),
+            label:    colors.label.clone(),
+            value:    colors.value.clone(),
+            heading:  colors.heading.clone(),
         }
     }
 
