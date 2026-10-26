@@ -1,5 +1,5 @@
 {
-  description = "Waybar syshealth streaming daemon (eBPF)";
+  description = "Low-overhead Linux system monitor daemon for Waybar";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -25,12 +25,17 @@
       pkgs = pkgsFor system;
       rstat = pkgs.rustPlatform.buildRustPackage {
         pname = "rstat";
-        version = "0.1.0";
+        version = "2.0.0";
         src = ./.;
-        cargoHash = "sha256-1O6RRWztQXukeM6WAc2KEbNRRhsAVxqr5MhtcTelFeo=";
-        RSTAT_BPFTOOL = "${pkgs.bpftools}/bin/bpftool";
-        RSTAT_CLANG = "${pkgs.llvmPackages.clang-unwrapped}/bin/clang";
-        RSTAT_LIBBPF_INCLUDE = "${pkgs.libbpf}/include";
+        cargoLock.lockFile = ./Cargo.lock;
+        nativeBuildInputs = [pkgs.makeWrapper];
+        # NVML is loaded at runtime from the NVIDIA driver, which NixOS installs under /run/opengl-driver;
+        # iw reports Wi-Fi links.
+        postFixup = ''
+          wrapProgram $out/bin/rstat \
+            --suffix LD_LIBRARY_PATH : /run/opengl-driver/lib \
+            --suffix PATH : ${pkgs.iw}/bin
+        '';
       };
     in {
       default = rstat;
@@ -44,18 +49,9 @@
       };
     in {
       default = pkgs.mkShell {
-        packages = with pkgs; [
-          rustToolchain
-          bpftools
-          clang
-          libbpf
-          mold
-          pkg-config
-        ];
-        RSTAT_BPFTOOL = "${pkgs.bpftools}/bin/bpftool";
-        RSTAT_CLANG = "${pkgs.llvmPackages.clang-unwrapped}/bin/clang";
-        RSTAT_LIBBPF_INCLUDE = "${pkgs.libbpf}/include";
+        packages = [rustToolchain pkgs.mold];
         RUSTFLAGS = "-C link-arg=-fuse-ld=mold";
+        LD_LIBRARY_PATH = "/run/opengl-driver/lib";
       };
     });
   };

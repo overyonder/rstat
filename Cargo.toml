@@ -1,8 +1,40 @@
 [package]
-name = "rstat"
-version = "0.1.0"
-edition = "2024"
+name        = "rstat"
+version     = "2.0.0"
+edition     = "2024"
+description = "Low-overhead Linux system monitor daemon for Waybar"
+license     = "MIT"
+repository  = "https://github.com/overyonder/rstat"
+readme      = "README.md"
+keywords    = ["waybar", "monitor", "procfs", "psi", "nvml"]
+categories  = ["command-line-utilities"]
 
 [dependencies]
-libc = "0.2"
-goblin = { version = "0.10", default-features = false, features = ["elf32", "elf64", "endian_fd", "std"] }
+nix          = { version = "0.30", default-features = false, features = ["feature", "fs", "net"] }
+nvml-wrapper = "0.11"
+serde_json   = "1"
+
+[lints.rust]
+warnings        = { level = "deny", priority = -1 }
+unsafe_code     = "deny"
+unreachable_pub = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+all      = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery  = { level = "warn", priority = -1 }
+cargo    = { level = "warn", priority = -1 }
+# Rates, percentages and byte counts are converted between integer counters and f64 throughout; every
+# value involved is far below the range where these conversions lose meaningful precision.
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+# nvml-wrapper and nix pull in transitive crates at more than one version.
+multiple_crate_versions = "allow"
+# The code-style rule is the narrowest visibility that works, written as pub(crate); unreachable_pub
+# already forbids bare pub inside private modules, so this nursery lint would contradict it.
+redundant_pub_crate = "allow"
+# Each section writes its tooltip top to bottom in one function so the code reads in the order the
+# tooltip does; splitting it to meet a line count would scatter one layout across helpers.
+too_many_lines = "allow"
