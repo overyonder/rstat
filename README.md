@@ -4,7 +4,9 @@
 own counters through file descriptors it keeps open, and serves five Waybar
 modules (CPU, memory, disks, network and NVIDIA GPU), each with a headline and a
 detailed tooltip. A section is sampled only while a Waybar module is watching
-it, and a module redraws only when its output changes.
+it or an [alert](#alerts) needs it, and a module redraws only when its output
+changes. Alerts run a command, naming the processes responsible, when a figure
+stays above a threshold.
 
 Headlines report saturation rather than utilization: how much work is waiting,
 not how busy something is.
@@ -147,6 +149,56 @@ nas = false                 # kernel_backlog, interfaces
 devices = [0]               # pcie, pcie_traffic, processes; devices lists NVML indices, empty for all
 processes = false
 ```
+
+### Alerts
+
+An alert runs a command when a figure stays above a threshold, and tells it
+which processes caused the strain. A section an alert watches is sampled
+whether or not Waybar is showing it.
+
+```toml
+[[alerts]]
+figure = "cpu.load"         # see the table below
+above = 20
+sustain_seconds = 5         # how long the figure must stay above; default 5
+repeat_seconds = 600        # how soon it may run again while the figure stays above; default 600
+command = ["/usr/local/bin/on-strain", "--notify"]
+```
+
+While the figure is above the threshold, the daemon reads every process once
+per sample and measures each one's contribution to that figure. Once the figure
+has stayed above for `sustain_seconds`, it starts the command and writes one
+JSON object to its standard input:
+
+```json
+{
+  "figure": "cpu.load", "value": 23.4, "above": 20, "window_seconds": 5.0,
+  "measure": "runnable_or_blocked_threads",
+  "offenders": [
+    {"session": 4211, "pid": 4230, "command": "make -j32", "processes": 33, "amount": 17.2, "share": 0.74}
+  ]
+}
+```
+
+Offenders are process sessions, the five contributing most, largest first. A
+session is a process and the children it started, unless they started their
+own, so a shell running one command line, or a terminal tab, is usually one.
+`pid` is the member contributing most, `command` the session leader's command
+line, and `share` the session's fraction of the measured total.
+
+| Figure | Value | Each process is measured by |
+| --- | --- | --- |
+| `cpu.load` | 1-minute load | threads runnable or in D state, averaged over the window |
+| `cpu.pressure` | CPU pressure, some, 10 s (%) | CPU seconds used in the window |
+| `memory.pressure_some`, `memory.pressure_full` | memory pressure, 10 s (%) | anonymous RAM and swap at the end of the window |
+| `disks.queue` | requests queued on local disks | bytes read from and written to block devices in the window |
+| `disks.pressure_some`, `disks.pressure_full` | I/O pressure, 10 s (%) | bytes read from and written to block devices in the window |
+| `network.nas_wait` | NAS (SMB) requests outstanding | threads in D state, averaged over the window |
+
+Waiting on the NAS puts a task in D state, so blocked threads stand for NAS
+requests. A process whose files the daemon may not read, such as another
+user's I/O counters, is left out. Reading every thread's state costs about
+100 ms, and it happens only while a load or NAS alert is above its threshold.
 
 ## NixOS and Home Manager
 

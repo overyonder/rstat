@@ -6,7 +6,8 @@ use std::time::Instant;
 
 use crate::config::DisksConfig;
 use crate::markup::{Markup, MarkupColors, Severity, WaybarReport};
-use crate::procfs_file::{ProcfsFile, keyed_value, parse_pressure};
+use crate::alerts::Figure;
+use crate::procfs_file::{ProcfsFile, keyed_value, parse_pressure, split_process_stat};
 
 /// Fields of /sys/block/*/stat (Documentation/block/stat.rst) used here. Sectors are 512 bytes.
 #[derive(Clone, Copy, Default)]
@@ -132,8 +133,8 @@ impl DisksSampler {
         if items.pressure || items.blocked_tasks {
             tooltip.heading("I/O pressure, local disks and NAS together (10s / 60s / 300s)");
         }
+        let (some, full) = parse_pressure(self.pressure.read());
         if items.pressure {
-            let (some, full) = parse_pressure(self.pressure.read());
             tooltip
                 .line()
                 .label("Some tasks stalled: ")
@@ -167,7 +168,12 @@ impl DisksSampler {
         let mut headline = Markup::new(colors);
         headline.high(total_queue, &format!("{total_queue:.2}"), 8.0, 32.0);
         let severity = headline.worst_severity().max(Severity::of_high(root_percent, 90.0, 97.0));
-        WaybarReport::new(headline.into_text(), tooltip.into_text(), severity)
+        let figures = vec![
+            (Figure::DisksQueue, total_queue),
+            (Figure::DisksPressureSome, some.ten_seconds),
+            (Figure::DisksPressureFull, full.ten_seconds),
+        ];
+        WaybarReport { figures, ..WaybarReport::new(headline.into_text(), tooltip.into_text(), severity) }
     }
 }
 
@@ -196,10 +202,9 @@ fn blocked_threads_by_command() -> Vec<(u64, String)> {
         }
         for thread in std::fs::read_dir(process.path().join("task")).into_iter().flatten().flatten() {
             let Ok(stat) = std::fs::read_to_string(thread.path().join("stat")) else { continue };
-            // The command name is parenthesised and may contain spaces or parentheses itself.
-            let (Some(open), Some(close)) = (stat.find('('), stat.rfind(')')) else { continue };
-            if stat[close + 1..].trim_start().starts_with('D') {
-                *counts.entry(stat[open + 1..close].to_owned()).or_default() += 1;
+            let Some((name, mut fields)) = split_process_stat(&stat) else { continue };
+            if fields.next() == Some("D") {
+                *counts.entry(name.to_owned()).or_default() += 1;
             }
         }
     }

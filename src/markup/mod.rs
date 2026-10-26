@@ -6,6 +6,8 @@
 
 use std::fmt::Write;
 
+use crate::alerts::Figure;
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 pub(crate) enum Severity {
     #[default]
@@ -173,11 +175,12 @@ pub(crate) struct WaybarReport {
     pub(crate) tooltip:  String,
     pub(crate) class:    &'static str,  // ok, warning or critical, or a section-specific state
     pub(crate) alt:      &'static str,  // Selects the module's format icon; empty when unused
+    pub(crate) figures:  Vec<(Figure, f64)>,  // The section's figures alerts can watch; not sent to Waybar
 }
 
 impl WaybarReport {
     pub(crate) const fn new(headline: String, tooltip: String, severity: Severity) -> Self {
-        Self { headline, tooltip, class: severity.class_name(), alt: "" }
+        Self { headline, tooltip, class: severity.class_name(), alt: "", figures: Vec::new() }
     }
 
     pub(crate) fn collecting_first_sample() -> Self {
@@ -186,12 +189,13 @@ impl WaybarReport {
             tooltip:  "Collecting a first sample; figures appear on the next refresh.".to_owned(),
             class:    "ok",
             alt:      "",
+            figures:  Vec::new(),
         }
     }
 
     /// For a section whose counters can't be read at all.
     pub(crate) fn unavailable(reason: &str) -> Self {
-        Self { headline: "N/A".to_owned(), tooltip: reason.to_owned(), class: "ok", alt: "" }
+        Self { headline: "N/A".to_owned(), tooltip: reason.to_owned(), class: "ok", alt: "", figures: Vec::new() }
     }
 
     pub(crate) fn to_json_line(&self) -> String {

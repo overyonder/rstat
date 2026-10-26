@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use crate::alerts::Figure;
 use crate::config::MemoryConfig;
 use crate::markup::{Markup, MarkupColors, Severity, WaybarReport};
 use crate::process_memory::{OwnerAnonymousMemory, ProcessMemoryWalk};
@@ -217,7 +218,8 @@ impl MemorySampler {
             .label(" · ")
             .low(available / GIB, &format!("{:.1}G", available / GIB), total * 0.15 / GIB, total * 0.05 / GIB);
         let severity = if oom_kills > 0.0 { Severity::Critical } else { tooltip.worst_severity().max(headline.worst_severity()) };
-        WaybarReport::new(headline.into_text(), tooltip.into_text(), severity)
+        let figures = vec![(Figure::MemoryPressureSome, some.ten_seconds), (Figure::MemoryPressureFull, full.ten_seconds)];
+        WaybarReport { figures, ..WaybarReport::new(headline.into_text(), tooltip.into_text(), severity) }
     }
 }
 

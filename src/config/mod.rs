@@ -11,12 +11,17 @@
 //! [gpu]
 //! devices = [0]
 //! processes = false
+//! [[alerts]]
+//! figure = "cpu.load"
+//! above = 20
+//! command = ["notify-send", "rstat"]
 //! ```
 
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::alerts::Figure;
 use crate::section::Section;
 
 #[derive(Deserialize)]
@@ -29,6 +34,28 @@ pub(crate) struct Config {
     pub(crate) disks:       DisksConfig,
     pub(crate) network:     NetworkConfig,
     pub(crate) gpu:         GpuConfig,
+    pub(crate) alerts:      Vec<AlertConfig>,
+}
+
+/// A command to run when a figure stays above a threshold; see the alerts module.
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AlertConfig {
+    pub(crate) figure:          Figure,
+    pub(crate) above:           f64,
+    #[serde(default = "default_sustain_seconds")]
+    pub(crate) sustain_seconds: u64,          // How long the figure must stay above before the command runs
+    #[serde(default = "default_repeat_seconds")]
+    pub(crate) repeat_seconds:  u64,          // How long after running the command it may run again
+    pub(crate) command:         Vec<String>,  // Program and arguments; receives the alert as JSON on stdin
+}
+
+const fn default_sustain_seconds() -> u64 {
+    5
+}
+
+const fn default_repeat_seconds() -> u64 {
+    600
 }
 
 /// Pango colours: strain figures use ok, warning and critical; labels are dim and headings stand out.
@@ -128,6 +155,7 @@ impl Default for Config {
             disks:       DisksConfig::default(),
             network:     NetworkConfig::default(),
             gpu:         GpuConfig::default(),
+            alerts:      Vec::new(),
         }
     }
 }
@@ -215,11 +243,20 @@ impl Config {
     /// missing default file means every default; a missing named file is an error.
     pub(crate) fn load(path: Option<&Path>) -> Result<Self, Box<dyn std::error::Error>> {
         let (path, required) = path.map_or_else(|| (default_config_path(), false), |path| (path.to_owned(), true));
-        match std::fs::read_to_string(&path) {
-            Ok(text) => Ok(toml::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?),
-            Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(error) => Err(format!("{}: {error}", path.display()).into()),
+        let config: Self = match std::fs::read_to_string(&path) {
+            Ok(text) => toml::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?,
+            Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(error) => return Err(format!("{}: {error}", path.display()).into()),
+        };
+        for alert in &config.alerts {
+            if alert.command.is_empty() {
+                return Err(format!("{}: the {} alert has an empty command", path.display(), alert.figure.name()).into());
+            }
+            if !config.serves(alert.figure.section()) {
+                return Err(format!("{}: the {} alert's section is disabled", path.display(), alert.figure.name()).into());
+            }
         }
+        Ok(config)
     }
 
     pub(crate) const fn serves(&self, section: Section) -> bool {

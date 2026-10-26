@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
+use crate::alerts::Figure;
 use crate::config::NetworkConfig;
 use crate::markup::{Markup, MarkupColors, Severity, WaybarReport};
 use crate::procfs_file::{ProcfsFile, read_trimmed};
@@ -294,7 +295,7 @@ impl NetworkSampler {
         // Strain in the tooltip's fault counters, link use and errors raises the class, as does the
         // retransmission ratio; the separate retransmit and timeout rates are informational.
         let severity = headline.worst_severity().max(ratio_severity).max(tooltip.worst_severity().min(Severity::Warning));
-        WaybarReport { alt, ..WaybarReport::new(headline.into_text(), tooltip.into_text(), severity) }
+        WaybarReport { alt, figures: vec![(Figure::NetworkNasWait, nas_wait)], ..WaybarReport::new(headline.into_text(), tooltip.into_text(), severity) }
     }
 }
 

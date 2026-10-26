@@ -32,6 +32,13 @@ self: {
     {
       interval_ms = cfg.intervalMs;
       inherit (cfg) colors;
+      alerts =
+        map (alert: {
+          inherit (alert) figure above command;
+          sustain_seconds = alert.sustainSeconds;
+          repeat_seconds = alert.repeatSeconds;
+        })
+        cfg.alerts;
     }
     // lib.mapAttrs (name: _: cfg.${name}) sections;
   configFile = (pkgs.formats.toml {}).generate "rstat.toml" settings;
@@ -56,6 +63,49 @@ in {
         label = colorOption "#7f849c" "Colour of labels.";
         value = colorOption "#cdd6f4" "Colour of descriptive figures.";
         heading = colorOption "#89b4fa" "Colour of tooltip headings.";
+      };
+      alerts = lib.mkOption {
+        default = [];
+        description = ''
+          Commands to run when a figure stays above a threshold. Each receives a JSON description on
+          standard input: the figure, its value and threshold, and the process sessions contributing
+          most to the strain. The figure's section is sampled whether or not Waybar watches it.
+        '';
+        type = lib.types.listOf (lib.types.submodule {
+          options = {
+            figure = lib.mkOption {
+              type = lib.types.enum [
+                "cpu.load"
+                "cpu.pressure"
+                "memory.pressure_some"
+                "memory.pressure_full"
+                "disks.queue"
+                "disks.pressure_some"
+                "disks.pressure_full"
+                "network.nas_wait"
+              ];
+              description = "The figure to watch.";
+            };
+            above = lib.mkOption {
+              type = lib.types.number;
+              description = "The threshold; pressures are percentages, load and queues are task or request counts.";
+            };
+            sustainSeconds = lib.mkOption {
+              type = lib.types.ints.unsigned;
+              default = 5;
+              description = "How long the figure must stay above the threshold before the command runs.";
+            };
+            repeatSeconds = lib.mkOption {
+              type = lib.types.ints.unsigned;
+              default = 600;
+              description = "How long after running the command it may run again while the figure stays above.";
+            };
+            command = lib.mkOption {
+              type = lib.types.nonEmptyListOf lib.types.str;
+              description = "The program and its arguments.";
+            };
+          };
+        });
       };
       waybarModules = lib.mkOption {
         type = lib.types.attrsOf (lib.types.attrsOf lib.types.anything);

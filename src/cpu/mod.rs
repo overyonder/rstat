@@ -3,6 +3,7 @@
 
 use std::time::Instant;
 
+use crate::alerts::Figure;
 use crate::config::CpuConfig;
 use crate::markup::{Markup, MarkupColors, Severity, WaybarReport};
 use crate::procfs_file::{ProcfsFile, parse_pressure, read_trimmed};
@@ -294,7 +295,8 @@ impl CpuSampler {
         }
 
         let severity = headline.worst_severity().max(thermal_severity.min(Severity::Warning));
-        WaybarReport::new(headline.into_text(), tooltip.into_text(), severity)
+        let figures = vec![(Figure::CpuLoad, load_one_minute), (Figure::CpuPressure, cpu_some.ten_seconds)];
+        WaybarReport { figures, ..WaybarReport::new(headline.into_text(), tooltip.into_text(), severity) }
     }
 }
 

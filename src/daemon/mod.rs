@@ -1,5 +1,7 @@
-//! The daemon: accepts watchers on a Unix socket, samples each section only while someone watches it,
-//! and sends a section's Waybar line to its watchers only when the line changes.
+//! The daemon: serves section lines to watchers on a Unix socket and figures to alerts.
+//!
+//! Each section is sampled only while someone watches it or an alert needs it, and its Waybar line is
+//! sent to its watchers only when the line changes.
 //!
 //! Protocol: a watcher connects, writes a section name and a newline, then reads one JSON line per
 //! change. It receives the latest line at once if the section is already being sampled.
@@ -11,6 +13,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use crate::alerts::Alert;
 use crate::config::Config;
 use crate::cpu::CpuSampler;
 use crate::disks::DisksSampler;
@@ -34,8 +37,12 @@ struct Subscriptions {
 }
 
 impl Subscriptions {
-    fn watched_sections(&self) -> Vec<Section> {
-        Section::ALL.into_iter().filter(|section| self.watchers.get(section).is_some_and(|list| !list.is_empty())).collect()
+    /// The sections to sample: those someone watches, and those an alert needs.
+    fn sampled_sections(&self, alert_sections: &[Section]) -> Vec<Section> {
+        Section::ALL
+            .into_iter()
+            .filter(|section| alert_sections.contains(section) || self.watchers.get(section).is_some_and(|list| !list.is_empty()))
+            .collect()
     }
 
     /// Sends a line to every watcher of a section, dropping those whose connection has gone.
@@ -127,6 +134,8 @@ pub fn serve_sections_to_watchers(config_path: Option<&Path>) -> Result<(), Box<
 
     let colors = MarkupColors::from_config(&config.colors);
     let mut samplers = Samplers::default();
+    let mut alerts: Vec<Alert> = config.alerts.iter().cloned().map(Alert::new).collect();
+    let alert_sections: Vec<Section> = alerts.iter().map(Alert::section).collect();
     let (subscriptions, changed) = &*shared;
     let mut next_sample = Instant::now();
     loop {
@@ -135,7 +144,7 @@ pub fn serve_sections_to_watchers(config_path: Option<&Path>) -> Result<(), Box<
             // Wait for the next sample time, or indefinitely while nothing is watched; a new watcher
             // wakes the loop early so its section is sampled at once.
             loop {
-                let watched = state.watched_sections();
+                let watched = state.sampled_sections(&alert_sections);
                 let unsampled = watched.iter().any(|section| !state.last_lines.contains_key(section));
                 let now = Instant::now();
                 if !watched.is_empty() && (unsampled || now >= next_sample) {
@@ -150,7 +159,13 @@ pub fn serve_sections_to_watchers(config_path: Option<&Path>) -> Result<(), Box<
         };
         next_sample = Instant::now() + interval;
         samplers.close_unwatched(&watched);
-        let lines: Vec<(Section, String)> = watched.iter().map(|section| (*section, samplers.sample(*section, &config, &colors).to_json_line())).collect();
+        let reports: Vec<(Section, WaybarReport)> = watched.iter().map(|section| (*section, samplers.sample(*section, &config, &colors))).collect();
+        for alert in &mut alerts {
+            if let Some((_, report)) = reports.iter().find(|(section, _)| *section == alert.section()) {
+                alert.observe(&report.figures);
+            }
+        }
+        let lines: Vec<(Section, String)> = reports.iter().map(|(section, report)| (*section, report.to_json_line())).collect();
 
         let mut state = subscriptions.lock().map_err(|_| "subscription lock poisoned")?;
         for (section, line) in lines {
@@ -159,7 +174,7 @@ pub fn serve_sections_to_watchers(config_path: Option<&Path>) -> Result<(), Box<
                 state.last_lines.insert(section, line);
             }
         }
-        let still_watched = state.watched_sections();
+        let still_watched = state.sampled_sections(&alert_sections);
         state.last_lines.retain(|section, _| still_watched.contains(section));
     }
 }

@@ -97,3 +97,10 @@ pub(crate) fn keyed_value(text: &str, name: &str) -> u64 {
         })
         .unwrap_or(0)
 }
+
+/// Splits a `/proc/PID/stat` or `/proc/PID/task/TID/stat` line into the command name and the fields
+/// after it, starting with the state. The name is parenthesised and may contain spaces or parentheses.
+pub(crate) fn split_process_stat(stat: &str) -> Option<(&str, std::str::SplitWhitespace<'_>)> {
+    let (open, close) = (stat.find('(')?, stat.rfind(')')?);
+    Some((stat.get(open + 1..close)?, stat.get(close + 1..)?.split_whitespace()))
+}
