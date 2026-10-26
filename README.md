@@ -12,7 +12,7 @@ not how busy something is.
 | Section | Headline | Tooltip |
 | --- | --- | --- |
 | `cpu` | 1-minute load · CPU pressure | load, pressure, interrupt pressure, utilization, context switches, frequency scaling, fans, CPU temperature, Intel thermal and ACPI throttling |
-| `memory` | memory pressure (all tasks stalled) · available RAM | pressure, swap and paging, refaults, reclaim, compaction, OOM kills, RAM composition, zram, per-process proportional memory |
+| `memory` | memory pressure (all tasks stalled) · available RAM | pressure, swap and paging, refaults, reclaim, compaction, OOM kills, RAM composition, zram, anonymous RAM and swap by program |
 | `disks` | average requests queued on local disks | per-disk busy time, queue, latency and throughput, dirty pages, root filesystem, I/O pressure, tasks blocked in D state |
 | `network` | average NAS (SMB) requests outstanding | NAS request rate and latency, TCP retransmissions and timeouts, listen and buffer errors, interfaces, link use |
 | `gpu` | GPU utilization · VRAM | utilization, encoder and decoder, VRAM, time under each clock-limit policy, clocks, power, temperature headroom, PCIe, VRAM by process |
@@ -44,9 +44,13 @@ second), so the disk and network headlines say which one is waiting.
   library, is opened with the first watcher and closed with the last.
 - **Expensive work only when needed.** Scanning every thread for D-state tasks
   costs about 100 ms, so it runs only while `/proc/stat` reports blocked tasks.
-  Per-process proportional memory needs root and a few hundred milliseconds, so
-  a system service writes it about once a minute with
-  `rstat sample-process-memory`, and the memory section reads that report.
+- **Memory by program from counters.** The memory section reads `RssAnon` and
+  `VmSwap` from each process's `/proc/PID/status`, which the kernel keeps
+  current, rather than the proportional figures in `smaps_rollup`, which cost
+  a page-table walk under each process's memory-map lock and need root. For
+  anonymous RAM the two agree. A swapped page shared by forked processes counts
+  in each of them, so swap can be overstated for programs with forked helpers,
+  such as browsers.
 
 ### Cost
 
@@ -56,8 +60,9 @@ daemon sampling once a second:
 | Section | Daemon CPU time |
 | --- | ---: |
 | `cpu`, `memory`, `disks`, `network` | under 1 ms per sample each |
+| `memory` process table | about 5 ms per sample, with about 750 tasks |
 | `gpu` | about 8 ms per sample |
-| all five | under 1% of one core |
+| all five | about 1.5% of one core |
 
 Almost all of the cost is the NVIDIA driver. Its maximum clocks and fan count
 are read once; its clock-limit violation counters, which cost about 6 ms to
@@ -143,27 +148,16 @@ devices = [0]               # pcie, pcie_traffic, processes; devices lists NVML 
 processes = false
 ```
 
-The memory section's process table comes from a root sampler, run about once a
-minute:
-
-```sh
-rstat sample-process-memory /run/waybar-memory-processes.json
-```
-
 ## NixOS and Home Manager
 
-The flake provides a NixOS module for the root sampler and a Home Manager module
-for the daemon, whose options mirror the configuration file
+The flake provides a Home Manager module for the daemon, whose options mirror
+the configuration file
 (`programs.rstat.cpu.fans`, `programs.rstat.gpu.devices` and so on, each
 documented in `nix/sections.nix`):
 
 ```nix
 # flake inputs
 rstat.url = "github:overyonder/rstat";
-
-# NixOS configuration
-imports = [inputs.rstat.nixosModules.default];
-services.rstat.processMemory.enable = true;
 
 # Home Manager configuration
 imports = [inputs.rstat.homeManagerModules.default];
@@ -226,9 +220,3 @@ Waybar restarts it:
 
 The sections are `cpu`, `memory`, `disks`, `network` and `gpu`. The network
 section sets `alt` to `ethernet`, `wifi` or `disconnected` for format icons.
-
-For the process table, a root cron entry is enough:
-
-```sh
-* * * * * /usr/local/bin/rstat sample-process-memory /run/waybar-memory-processes.json
-```

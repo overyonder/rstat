@@ -34,6 +34,9 @@ impl ProcfsFile {
                 Ok(read) => {
                     self.buffer.truncate(start + read);
                     offset += read as u64;
+                    if read < spare {
+                        break;  // A short read is the end; reading on would make the kernel regenerate the file
+                    }
                 }
             }
         }

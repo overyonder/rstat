@@ -20,7 +20,7 @@
     reclaim = "Direct and background reclaim, compaction stalls and OOM kills.";
     ram = "Available and free memory, swap use and RAM composition.";
     zram = "Compressed swap held in RAM.";
-    processes = "Proportional memory by process, from the root sampler.";
+    processes = "Anonymous RAM and swap by program.";
   };
   disks = {
     devices = "Busy time, queue, throughput and latency for each disk.";

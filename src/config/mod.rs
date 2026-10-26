@@ -71,7 +71,7 @@ pub(crate) struct MemoryConfig {
     pub(crate) reclaim:   bool,  // Direct and background reclaim, compaction stalls, OOM kills
     pub(crate) ram:       bool,  // Available and free memory, swap use and composition
     pub(crate) zram:      bool,  // Compressed swap in RAM
-    pub(crate) processes: bool,  // The root sampler's per-process table
+    pub(crate) processes: bool,  // Anonymous RAM and swap by program
 }
 
 #[derive(Deserialize, Clone, Copy)]

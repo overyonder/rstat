@@ -1,16 +1,16 @@
-//! Memory section: pressure, paging and reclaim, RAM composition including zram, and the per-process
-//! report. Headline: memory pressure (all tasks stalled, 10s) · available RAM.
+//! Memory section: pressure, paging and reclaim, RAM composition including zram, and anonymous memory
+//! by program. Headline: memory pressure (all tasks stalled, 10s) · available RAM.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use crate::config::MemoryConfig;
 use crate::markup::{Markup, MarkupColors, Severity, WaybarReport};
+use crate::process_memory::{OwnerAnonymousMemory, ProcessMemoryWalk};
 use crate::procfs_file::{ProcfsFile, keyed_value, parse_pressure};
 
-/// Written by `rstat sample-process-memory`, run as root by a system service.
-pub(crate) const PROCESS_MEMORY_REPORT: &str = "/run/waybar-memory-processes.json";
+/// Programs shown by name in the process table; the rest are summed as other processes.
+const LISTED_OWNERS: usize = 12;
 
 const GIB: f64 = 1_073_741_824.0;
 const MIB: f64 = 1_048_576.0;
@@ -20,6 +20,7 @@ pub(crate) struct MemorySampler {
     vmstat:    ProcfsFile,
     pressure:  ProcfsFile,
     zram:      Vec<ProcfsFile>,  // mm_stat per zram device, in bytes
+    processes: Option<ProcessMemoryWalk>,  // Present while the process table is shown
     page_size: f64,
     previous:  Option<(Instant, HashMap<String, u64>)>,
     items:     MemoryConfig,
@@ -44,6 +45,7 @@ impl MemorySampler {
             vmstat:    open("/proc/vmstat")?,
             pressure:  open("/proc/pressure/memory")?,
             zram,
+            processes: items.processes.then(ProcessMemoryWalk::new),
             page_size: nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE).ok().flatten().unwrap_or(4096) as f64,
             previous:  None,
             items,
@@ -204,8 +206,8 @@ impl MemorySampler {
                 .value(&format!("{:.2} GiB", (zram_physical - zram_payload) / GIB))
                 .label(")");
         }
-        if items.processes {
-            write_process_memory_rows(&mut tooltip);
+        if let Some(processes) = &mut self.processes {
+            write_process_memory_rows(&mut tooltip, &processes.sample_owners_by_anonymous_memory());
         }
 
         let mut headline = Markup::new(colors);
@@ -218,34 +220,19 @@ impl MemorySampler {
     }
 }
 
-/// Appends the per-process table from the root sampler's report. Its figures are descriptive, so they
-/// don't affect the section's severity; only a stale report is flagged.
-fn write_process_memory_rows(tooltip: &mut Markup<'_>) {
-    let report: Option<serde_json::Value> =
-        std::fs::read_to_string(PathBuf::from(PROCESS_MEMORY_REPORT)).ok().and_then(|text| serde_json::from_str(&text).ok());
-    let Some(report) = report else {
-        tooltip.line().line().label("Process memory sampler unavailable (requires the system service).");
-        return;
-    };
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |elapsed| elapsed.as_secs_f64());
-    let age = now - report["timestamp"].as_f64().unwrap_or(0.0);
-    tooltip.heading("Processes: anonymous RAM + swap, GiB, proportional");
-    tooltip.line().label(&format!("Sampled {age:.0}s ago, every 60s"));
-    if age > 120.0 {
-        tooltip.label(" ").toned(Severity::Warning, "stale");
-    }
-    tooltip.line().label(&format!("{:<28} {:>6} {:>6} {:>6}", "Owner (processes)", "RAM", "Swap", "Total"));
-    for owner in report["owners"].as_array().into_iter().flatten() {
-        let name = format!("{} ({})", owner["name"].as_str().unwrap_or("?"), owner["processes"].as_u64().unwrap_or(0));
-        let ram = owner["ram_gib"].as_f64().unwrap_or(0.0);
-        let swap = owner["swap_gib"].as_f64().unwrap_or(0.0);
-        let name: String = name.chars().take(28).collect();
+/// Appends the table of anonymous memory by program. Its figures are descriptive, so they don't affect
+/// the section's severity.
+fn write_process_memory_rows(tooltip: &mut Markup<'_>, owners: &[OwnerAnonymousMemory]) {
+    let gib = |kib: u64| kib as f64 / 1_048_576.0;
+    tooltip.heading("Processes: anonymous RAM + swap, GiB");
+    tooltip.line().label(&format!("{:<28} {:>6} {:>6} {:>6}", "Program (processes)", "RAM", "Swap", "Total"));
+    for owner in owners.iter().take(LISTED_OWNERS) {
+        let name: String = format!("{} ({})", owner.name, owner.process_count).chars().take(28).collect();
+        let (ram, swap) = (gib(owner.resident_kib), gib(owner.swapped_kib));
         tooltip.line().value(&format!("{name:<28} {ram:>6.2} {swap:>6.2} {:>6.2}", ram + swap));
     }
-    tooltip.line().label("Other processes: ").value(&format!("{:.2} GiB", report["other_gib"].as_f64().unwrap_or(0.0)));
+    let other: u64 = owners.iter().skip(LISTED_OWNERS).map(|owner| owner.resident_kib + owner.swapped_kib).sum();
+    tooltip.line().label("Other processes: ").value(&format!("{:.2} GiB", gib(other)));
+    tooltip.line().label("Swap shared by forked processes counts in each, so it can overstate.");
     tooltip.line().label("File-backed pages are included in file cache, not these rows.");
-    let inaccessible = report["inaccessible"].as_u64().unwrap_or(0);
-    if inaccessible > 0 {
-        tooltip.line().label(&format!("{inaccessible} processes inaccessible; ownership is incomplete."));
-    }
 }

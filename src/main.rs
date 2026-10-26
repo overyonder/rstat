@@ -2,7 +2,6 @@
 //!
 //!   rstat daemon [--config PATH]           sample the sections watchers ask for and serve their output
 //!   rstat watch cpu|memory|disks|network|gpu   print one section's Waybar JSON line on every change
-//!   rstat sample-process-memory OUTPUT     write per-process proportional memory (run as root, periodically)
 
 use std::process::ExitCode;
 
@@ -16,8 +15,7 @@ fn main() -> ExitCode {
             || Err(format!("unknown section {name}: use cpu, memory, disks, network or gpu").into()),
             rstat::watch::print_section_updates,
         ),
-        ["sample-process-memory", output] => rstat::process_memory::write_process_memory_report(output.as_ref()),
-        _ => Err("usage: rstat daemon [--config PATH] | rstat watch SECTION | rstat sample-process-memory OUTPUT".into()),
+        _ => Err("usage: rstat daemon [--config PATH] | rstat watch SECTION".into()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

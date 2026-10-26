@@ -1,22 +1,107 @@
-//! Per-process proportional memory, sampled separately from the daemon.
+//! Per-process anonymous memory, grouped by the program each process belongs to.
 //!
-//! Reading every process's `smaps_rollup` takes a few hundred milliseconds and needs root, so a system
-//! service runs `rstat sample-process-memory` about once a minute and the memory section reads the
-//! report it leaves.
+//! Each process's `/proc/PID/status` holds `RssAnon` and `VmSwap`, counters the kernel keeps as pages
+//! are mapped and swapped, so reading them costs no page-table walk and needs no root. For anonymous
+//! RAM they match the proportional `Pss_Anon` of `smaps_rollup`. `VmSwap` counts a swapped page shared
+//! by forked processes in each of them, so for programs with forked helpers, such as browsers, swap is
+//! an upper bound.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::Path;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-/// Owners shown by name in the report; the rest are summed as other processes.
-const LISTED_OWNERS: usize = 12;
+use crate::procfs_file::{ProcfsFile, keyed_value};
 
-/// One owner's proportional anonymous memory, in KiB.
-#[derive(Default)]
-struct OwnerMemory {
-    resident_kib:  u64,  // Pss_Anon
-    swapped_kib:   u64,  // SwapPss
-    process_count: u64,
+/// One program's anonymous memory, summed over its processes.
+pub(crate) struct OwnerAnonymousMemory {
+    pub(crate) name:          String,
+    pub(crate) process_count: u64,
+    pub(crate) resident_kib:  u64,  // RssAnon
+    pub(crate) swapped_kib:   u64,  // VmSwap
+}
+
+/// A process's status file, kept open between samples, and the program it belongs to.
+struct TrackedProcess {
+    status:       ProcfsFile,
+    command_name: String,  // status Name when the label was derived; a change means an exec
+    owner_label:  String,
+}
+
+/// What the walk knows about a PID listed in /proc.
+enum TrackedTask {
+    /// Has no address space and never will: a kernel thread, or a zombie whose memory is released.
+    /// Not read again while its PID stays listed; PIDs are allocated in a cycle up to `pid_max`, so a
+    /// PID isn't reused between two samples.
+    WithoutMemory,
+    Process(TrackedProcess),
+}
+
+/// Keeps every process's status file open and re-reads it each sample. A held descriptor refers to
+/// its process, not its PID, so it reads nothing once the process exits, even if the PID is reused.
+pub(crate) struct ProcessMemoryWalk {
+    tasks: HashMap<u32, TrackedTask>,
+}
+
+impl ProcessMemoryWalk {
+    /// Raises the soft open-file limit to the hard limit, since one descriptor is held per process and
+    /// the usual soft limit of 1024 is near a desktop's process count.
+    pub(crate) fn new() -> Self {
+        use nix::sys::resource::{Resource, getrlimit, setrlimit};
+        if let Ok((soft, hard)) = getrlimit(Resource::RLIMIT_NOFILE)
+            && soft < hard
+        {
+            let _ = setrlimit(Resource::RLIMIT_NOFILE, hard, hard);  // Without it, processes past the limit go unlisted
+        }
+        Self { tasks: HashMap::new() }
+    }
+
+    /// Every program's anonymous memory, largest first. Tasks without an address space and processes
+    /// that exit during the walk are skipped.
+    pub(crate) fn sample_owners_by_anonymous_memory(&mut self) -> Vec<OwnerAnonymousMemory> {
+        let mut owners: HashMap<String, OwnerAnonymousMemory> = HashMap::new();
+        let mut tasks = HashMap::with_capacity(self.tasks.len());
+        for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+            let Some(process_id) = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else { continue };
+            let mut process = match self.tasks.remove(&process_id) {
+                Some(TrackedTask::Process(process)) => process,
+                Some(TrackedTask::WithoutMemory) => {
+                    tasks.insert(process_id, TrackedTask::WithoutMemory);
+                    continue;
+                }
+                None => {
+                    let Some(status) = ProcfsFile::open(entry.path().join("status")) else { continue };
+                    TrackedProcess { status, command_name: String::new(), owner_label: String::new() }
+                }
+            };
+            let status = process.status.read();
+            if status.is_empty() {
+                continue;  // Exited
+            }
+            if !status.contains("\nRssAnon:") {
+                tasks.insert(process_id, TrackedTask::WithoutMemory);
+                continue;
+            }
+            let command_name = status.lines().find_map(|line| line.strip_prefix("Name:")).unwrap_or_default().trim();
+            let (resident_kib, swapped_kib) = (keyed_value(status, "RssAnon"), keyed_value(status, "VmSwap"));
+            if process.command_name != command_name {
+                command_name.clone_into(&mut process.command_name);
+                process.owner_label = process_owner_label(process_id);
+            }
+            let owner = owners.entry(process.owner_label.clone()).or_insert_with(|| OwnerAnonymousMemory {
+                name:          process.owner_label.clone(),
+                process_count: 0,
+                resident_kib:  0,
+                swapped_kib:   0,
+            });
+            owner.process_count += 1;
+            owner.resident_kib += resident_kib;
+            owner.swapped_kib += swapped_kib;
+            tasks.insert(process_id, TrackedTask::Process(process));
+        }
+        self.tasks = tasks;
+        let mut ranked: Vec<OwnerAnonymousMemory> = owners.into_values().collect();
+        ranked.sort_by_key(|owner| std::cmp::Reverse(owner.resident_kib + owner.swapped_kib));
+        ranked
+    }
 }
 
 /// Names the program a process belongs to: the executable named by argv[0], with Nix's wrapper
@@ -34,58 +119,4 @@ pub(crate) fn process_owner_label(process_id: u32) -> String {
     } else {
         name.to_owned()
     }
-}
-
-/// Writes the report as JSON: `timestamp` (Unix seconds), `duration` (seconds), `owners` (rows of
-/// `name`, `processes`, `ram_gib`, `swap_gib`, largest first), `other_gib` and `inaccessible`.
-/// # Errors
-///
-/// Fails if /proc can't be listed or the report can't be written.
-pub fn write_process_memory_report(output: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let started = Instant::now();
-    let mut owners: BTreeMap<String, OwnerMemory> = BTreeMap::new();
-    let mut inaccessible = 0;
-    for entry in std::fs::read_dir("/proc")?.flatten() {
-        let Some(process_id) = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else { continue };
-        let rollup = match std::fs::read_to_string(entry.path().join("smaps_rollup")) {
-            Ok(rollup) => rollup,
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                inaccessible += 1;
-                continue;
-            }
-            Err(_) => continue,  // Exited, or a kernel thread with no memory map
-        };
-        let owner = owners.entry(process_owner_label(process_id)).or_default();
-        owner.resident_kib += crate::procfs_file::keyed_value(&rollup, "Pss_Anon");
-        owner.swapped_kib += crate::procfs_file::keyed_value(&rollup, "SwapPss");
-        owner.process_count += 1;
-    }
-    let mut ranked: Vec<(String, OwnerMemory)> = owners.into_iter().collect();
-    ranked.sort_by_key(|(_, memory)| std::cmp::Reverse(memory.resident_kib + memory.swapped_kib));
-    let gib = |kib: u64| kib as f64 / 1_048_576.0;
-    let listed: Vec<serde_json::Value> = ranked
-        .iter()
-        .take(LISTED_OWNERS)
-        .map(|(name, memory)| {
-            serde_json::json!({
-                "name": name,
-                "processes": memory.process_count,
-                "ram_gib": gib(memory.resident_kib),
-                "swap_gib": gib(memory.swapped_kib),
-            })
-        })
-        .collect();
-    let other_gib: f64 = ranked.iter().skip(LISTED_OWNERS).map(|(_, memory)| gib(memory.resident_kib + memory.swapped_kib)).sum();
-    let report = serde_json::json!({
-        "timestamp": SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64(),
-        "duration": started.elapsed().as_secs_f64(),
-        "owners": listed,
-        "other_gib": other_gib,
-        "inaccessible": inaccessible,
-    });
-    let temporary = output.with_extension("tmp");
-    std::fs::write(&temporary, report.to_string())?;
-    std::fs::set_permissions(&temporary, std::os::unix::fs::PermissionsExt::from_mode(0o644))?;
-    std::fs::rename(&temporary, output)?;
-    Ok(())
 }

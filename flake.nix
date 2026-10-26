@@ -42,7 +42,6 @@
       rstat = rstat;
     });
 
-    nixosModules.default = import ./nix/nixos.nix self;
     homeManagerModules.default = import ./nix/home-manager.nix self;
 
     devShells = forAllSystems (system: let
