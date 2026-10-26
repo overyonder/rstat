@@ -127,7 +127,8 @@ impl MemorySampler {
                 .high(swap_in, &format!("{swap_in:.2} MiB/s"), 1.0, 20.0)
                 .label(" · swap-out: ")
                 .high(swap_out, &format!("{swap_out:.2} MiB/s"), 1.0, 20.0);
-            tooltip.line().label("Major page faults: ").high(major_faults, &format!("{major_faults:.0}/s"), 500.0, 5000.0);
+            // Reading a newly opened file faults too, so major faults alone aren't strain; refaults are
+            tooltip.line().label("Major page faults: ").value(&format!("{major_faults:.0}/s"));
             tooltip
                 .line()
                 .label("Refaults of evicted pages: anonymous ")
