@@ -11,7 +11,7 @@ not how busy something is.
 
 | Section | Headline | Tooltip |
 | --- | --- | --- |
-| `cpu` | 1-minute load · CPU pressure | load, pressure, interrupt pressure, utilization, context switches, frequency scaling, fans |
+| `cpu` | 1-minute load · CPU pressure | load, pressure, interrupt pressure, utilization, context switches, frequency scaling, fans, CPU temperature, Intel thermal-throttling events |
 | `memory` | memory pressure (all tasks stalled) · available RAM | pressure, swap and paging, refaults, reclaim, compaction, OOM kills, RAM composition, zram, per-process proportional memory |
 | `disks` | average requests queued on local disks | per-disk busy time, queue, latency and throughput, dirty pages, root filesystem, I/O pressure, tasks blocked in D state |
 | `network` | average NAS (SMB) requests outstanding | NAS request rate and latency, TCP retransmissions and timeouts, listen and buffer errors, interfaces, link use |
@@ -150,5 +150,66 @@ For the memory section's process table, run as root about once a minute:
 rstat sample-process-memory /run/waybar-memory-processes.json
 ```
 
-The CPU section also shows the summary lines of
-`/run/waybar-hardware-health.json` when another service writes it.
+### Example: NixOS and Home Manager
+
+```nix
+# flake.nix inputs
+rstat.url = "github:overyonder/rstat";
+
+# NixOS configuration: the root process-memory sampler.
+systemd.services.rstat-process-memory = {
+  serviceConfig = {
+    Type = "oneshot";
+    ExecStart = "${rstat}/bin/rstat sample-process-memory /run/waybar-memory-processes.json";
+    Nice = 19;
+  };
+};
+systemd.timers.rstat-process-memory = {
+  wantedBy = ["timers.target"];
+  timerConfig = { OnBootSec = "30s"; OnUnitInactiveSec = "60s"; };
+};
+
+# Home Manager configuration: the daemon and the Waybar modules.
+systemd.user.services.rstat = {
+  Unit.PartOf = ["graphical-session.target"];
+  Service = {
+    ExecStart = "${rstat}/bin/rstat daemon";
+    Restart = "on-failure";
+    Environment = ["COLOR_OK=#a6e3a1" "COLOR_WARNING=#fab387" "COLOR_CRITICAL=#f38ba8"];
+  };
+  Install.WantedBy = ["graphical-session.target"];
+};
+programs.waybar.settings.main = {
+  "custom/cpu"     = { exec = "${rstat}/bin/rstat watch cpu";     return-type = "json"; restart-interval = 5; };
+  "custom/memory"  = { exec = "${rstat}/bin/rstat watch memory";  return-type = "json"; restart-interval = 5; };
+  "custom/disks"   = { exec = "${rstat}/bin/rstat watch disks";   return-type = "json"; restart-interval = 5; };
+  "custom/network" = { exec = "${rstat}/bin/rstat watch network"; return-type = "json"; restart-interval = 5; };
+  "custom/gpu"     = { exec = "${rstat}/bin/rstat watch gpu";     return-type = "json"; restart-interval = 5; };
+};
+```
+
+Here `rstat` is `inputs.rstat.packages.${pkgs.system}.default`.
+
+### Example: other distributions
+
+`~/.config/systemd/user/rstat.service`, enabled with
+`systemctl --user enable --now rstat`:
+
+```ini
+[Unit]
+Description=rstat system monitor for Waybar
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=/usr/local/bin/rstat daemon
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target
+```
+
+For the process table, a root cron entry is enough:
+
+```sh
+* * * * * /usr/local/bin/rstat sample-process-memory /run/waybar-memory-processes.json
+```

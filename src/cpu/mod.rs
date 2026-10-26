@@ -19,6 +19,22 @@ struct CpuCounters {
     forks:             u64,
 }
 
+/// Drivers whose hwmon temperatures are the CPU's own sensors.
+const CPU_TEMPERATURE_DRIVERS: [&str; 3] = ["k10temp", "zenpower", "coretemp"];
+
+/// One CPU temperature sensor, in millidegrees Celsius.
+struct CpuTemperature {
+    input: ProcfsFile,
+    name:  String,  // The sensor's label, such as Tctl or Package id 0
+}
+
+/// Intel's thermal throttling event counters, per CPU, under `cpuN/thermal_throttle`.
+/// Package counters repeat on every CPU of the package, so only the largest is used.
+struct ThrottleCounters {
+    core:    Vec<ProcfsFile>,
+    package: Vec<ProcfsFile>,
+}
+
 struct Fan {
     speed: ProcfsFile,
     name:  String,  // "sensor / label"
@@ -31,6 +47,9 @@ pub(crate) struct CpuSampler {
     irq_pressure:     Option<ProcfsFile>,
     current_freqs:    Vec<ProcfsFile>,  // scaling_cur_freq per CPU, kHz
     fans:             Vec<Fan>,
+    temperatures:     Vec<CpuTemperature>,
+    throttle:         ThrottleCounters,
+    previous_throttle: Option<(u64, u64)>,  // Core events summed, package events at the last sample
     cpu_count:        f64,
     previous:         Option<(Instant, CpuCounters)>,
 }
@@ -39,6 +58,8 @@ impl CpuSampler {
     pub(crate) fn open() -> std::io::Result<Self> {
         let mut current_freqs = Vec::new();
         let mut cpu_count = 0.0;
+        let mut core_throttle = Vec::new();
+        let mut package_throttle = Vec::new();
         for entry in std::fs::read_dir("/sys/devices/system/cpu")?.flatten() {
             let name = entry.file_name();
             let Some(index) = name.to_str().and_then(|name| name.strip_prefix("cpu")) else { continue };
@@ -46,13 +67,26 @@ impl CpuSampler {
                 continue;
             }
             cpu_count += 1.0;
+            core_throttle.extend(ProcfsFile::open(entry.path().join("thermal_throttle/core_throttle_count")));
+            package_throttle.extend(ProcfsFile::open(entry.path().join("thermal_throttle/package_throttle_count")));
             if let Some(file) = ProcfsFile::open(entry.path().join("cpufreq/scaling_cur_freq")) {
                 current_freqs.push(file);
             }
         }
         let mut fans = Vec::new();
+        let mut temperatures = Vec::new();
         for sensor in std::fs::read_dir("/sys/class/hwmon").into_iter().flatten().flatten() {
             let sensor_name = read_trimmed(sensor.path().join("name")).unwrap_or_default();
+            if CPU_TEMPERATURE_DRIVERS.contains(&sensor_name.as_str()) {
+                for input in std::fs::read_dir(sensor.path()).into_iter().flatten().flatten() {
+                    let file_name = input.file_name().to_string_lossy().into_owned();
+                    let Some(stem) = file_name.strip_suffix("_input").filter(|stem| stem.starts_with("temp")) else { continue };
+                    let name = read_trimmed(sensor.path().join(format!("{stem}_label"))).unwrap_or_else(|| stem.to_owned());
+                    if let Some(input) = ProcfsFile::open(input.path()) {
+                        temperatures.push(CpuTemperature { input, name });
+                    }
+                }
+            }
             for input in std::fs::read_dir(sensor.path()).into_iter().flatten().flatten() {
                 let file_name = input.file_name().to_string_lossy().into_owned();
                 let Some(stem) = file_name.strip_prefix("fan").and_then(|rest| rest.strip_suffix("_input")) else { continue };
@@ -69,6 +103,9 @@ impl CpuSampler {
             irq_pressure: ProcfsFile::open("/proc/pressure/irq"),
             current_freqs,
             fans,
+            temperatures,
+            throttle: ThrottleCounters { core: core_throttle, package: package_throttle },
+            previous_throttle: None,
             cpu_count,
             previous: None,
         })
@@ -170,10 +207,35 @@ impl CpuSampler {
             let speed = fan.speed.read_value::<u64>().unwrap_or(0);
             tooltip.field(&format!("Fan {}: {speed} RPM", fan.name));
         }
-        // A system service samples CPU throttling MSRs, which need root, into this file.
-        let (health, health_severity) = read_hardware_health();
-        for line in health.lines().filter(|line| line.starts_with("CPU") || line.starts_with("MSR_") || line.starts_with("Hardware health")) {
-            tooltip.field(line);
+        // Temperature and throttling raise the section to a warning at most; load and pressure decide the rest.
+        let mut thermal_severity = Severity::Ok;
+        self.temperatures.sort_by(|left, right| left.name.cmp(&right.name));
+        if !self.temperatures.is_empty() {
+            tooltip.line().label("Temperature: ");
+            for (index, sensor) in self.temperatures.iter_mut().enumerate() {
+                let celsius = sensor.input.read_value::<f64>().unwrap_or(0.0) / 1000.0;
+                if index > 0 {
+                    tooltip.label(", ");
+                }
+                thermal_severity = thermal_severity.max(Severity::of_high(celsius, 85.0, 95.0));
+                tooltip.label(&format!("{} ", sensor.name)).high(celsius, &format!("{celsius:.0} C"), 85.0, 95.0);
+            }
+        }
+        if !self.throttle.core.is_empty() {
+            let core: u64 = self.throttle.core.iter_mut().filter_map(ProcfsFile::read_value::<u64>).sum();
+            let package = self.throttle.package.iter_mut().filter_map(ProcfsFile::read_value::<u64>).max().unwrap_or(0);
+            if let Some((previous_core, previous_package)) = self.previous_throttle.replace((core, package)) {
+                let core_events = core.saturating_sub(previous_core) as f64;
+                let package_events = package.saturating_sub(previous_package) as f64;
+                thermal_severity = thermal_severity.max(Severity::of_high(core_events + package_events, 1.0, 100.0));
+                tooltip
+                    .line()
+                    .label("Thermal throttling events: cores ")
+                    .high(core_events, &format!("{core_events:.0}"), 1.0, 100.0)
+                    .label(", package ")
+                    .high(package_events, &format!("{package_events:.0}"), 1.0, 100.0)
+                    .label(&format!(" in the last {seconds:.0}s"));
+            }
         }
 
         let mut headline = Markup::new(colors);
@@ -181,7 +243,7 @@ impl CpuSampler {
             .high(load_one_minute, &format!("{load_one_minute:.2}"), cpus, 2.0 * cpus)
             .label(" · ")
             .high(cpu_some.ten_seconds, &format!("{:.1}%", cpu_some.ten_seconds), 10.0, 40.0);
-        let severity = headline.worst_severity().max(health_severity);
+        let severity = headline.worst_severity().max(thermal_severity.min(Severity::Warning));
         WaybarReport::new(headline.into_text(), tooltip.into_text(), severity)
     }
 }
@@ -260,17 +322,4 @@ fn cpu_scaling_lines() -> Vec<String> {
         lines.push(format!("Turbo: {}", if no_turbo == "0" { "enabled" } else { "disabled" }));
     }
     lines
-}
-
-/// The hardware-health service's tooltip text and severity, from /run/waybar-hardware-health.json.
-fn read_hardware_health() -> (String, Severity) {
-    let Some(document) = std::fs::read_to_string("/run/waybar-hardware-health.json")
-        .ok()
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-    else {
-        return ("Hardware health: sampler unavailable".to_owned(), Severity::Ok);
-    };
-    let tooltip = document["tooltip"].as_str().unwrap_or("").to_owned();
-    let severity = if document["class"] == "warning" { Severity::Warning } else { Severity::Ok };
-    (tooltip, severity)
 }
