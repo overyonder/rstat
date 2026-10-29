@@ -1,4 +1,4 @@
-//! Memory section: pressure, paging and reclaim, RAM composition including zram, and anonymous memory
+//! Memory section: pressure, paging and reclaim, RAM composition including zswap and zram, and anonymous memory
 //! by program. Headline: memory pressure (all tasks stalled, 10s) · available RAM.
 
 use std::collections::HashMap;
@@ -30,7 +30,7 @@ pub(crate) struct MemorySampler {
 impl MemorySampler {
     pub(crate) fn open(items: MemoryConfig) -> std::io::Result<Self> {
         let open = |path: &str| ProcfsFile::open(path).ok_or_else(|| std::io::Error::other(format!("cannot open {path}")));
-        let zram = if items.zram {
+        let zram = if items.ram || items.zram {
             std::fs::read_dir("/sys/block")
                 .into_iter()
                 .flatten()
@@ -74,6 +74,8 @@ impl MemorySampler {
 
         let meminfo = self.meminfo.read().to_owned();
         let bytes = |name: &str| keyed_value(&meminfo, name) as f64 * 1024.0;
+        let zswap_physical = bytes("Zswap");
+        let zswap_logical = bytes("Zswapped");
         let (mut zram_logical, mut zram_payload, mut zram_physical) = (0.0, 0.0, 0.0);
         for device in &mut self.zram {
             let fields: Vec<f64> = device.read().split_whitespace().take(3).filter_map(|field| field.parse().ok()).collect();
@@ -156,11 +158,11 @@ impl MemorySampler {
                 .label(" since boot");
         }
 
-        let outside_zram = total - bytes("MemFree") - zram_physical;
+        let outside_compressed_swap = total - bytes("MemFree") - zswap_physical - zram_physical;
         let cache = bytes("Cached") + bytes("Buffers");
         let kernel_other = bytes("PageTables") + bytes("SecPageTables") + bytes("KernelStack") + bytes("Percpu");
-        let other = outside_zram - bytes("AnonPages") - cache - bytes("Slab") - kernel_other - bytes("SwapCached");
-        if items.ram || items.zram {
+        let other = outside_compressed_swap - bytes("AnonPages") - cache - bytes("Slab") - kernel_other - bytes("SwapCached");
+        if items.ram || items.zswap || items.zram {
             tooltip.heading("RAM");
         }
         if items.ram {
@@ -179,7 +181,7 @@ impl MemorySampler {
                 .value(&format!("{:.2} GiB", bytes("MemFree") / GIB))
                 .label(" · swap used: ")
                 .value(&format!("{:.2} of {:.2} GiB", (bytes("SwapTotal") - bytes("SwapFree")) / GIB, bytes("SwapTotal") / GIB));
-            tooltip.line().label("In use outside zram: ").value(&format!("{:.2} GiB", outside_zram / GIB));
+            tooltip.line().label("In use outside compressed swap: ").value(&format!("{:.2} GiB", outside_compressed_swap / GIB));
             tooltip
                 .line()
                 .label("  anonymous ")
@@ -195,7 +197,15 @@ impl MemorySampler {
                 .label(" · other ")
                 .value(&format!("{:.2} GiB", other / GIB));
         }
-        if items.zram {
+        if items.zswap && meminfo.lines().any(|line| line.starts_with("Zswap:")) {
+            tooltip
+                .line()
+                .label("Zswap: ")
+                .value(&format!("{:.2} GiB", zswap_logical / GIB))
+                .label(" stored in ")
+                .value(&format!("{:.2} GiB", zswap_physical / GIB));
+        }
+        if items.zram && !self.zram.is_empty() {
             tooltip
                 .line()
                 .label("Zram: ")

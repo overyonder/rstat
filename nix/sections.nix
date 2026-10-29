@@ -19,6 +19,7 @@
     paging = "Swap traffic, major page faults and refaults.";
     reclaim = "Direct and background reclaim, compaction stalls and OOM kills.";
     ram = "Available and free memory, swap use and RAM composition.";
+    zswap = "Original size and physical RAM use of the compressed swap cache.";
     zram = "Compressed swap held in RAM.";
     processes = "Anonymous RAM and swap by program.";
   };

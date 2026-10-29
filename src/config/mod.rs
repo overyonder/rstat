@@ -97,6 +97,7 @@ pub(crate) struct MemoryConfig {
     pub(crate) paging:    bool,  // Swap traffic, major faults and refaults
     pub(crate) reclaim:   bool,  // Direct and background reclaim, compaction stalls, OOM kills
     pub(crate) ram:       bool,  // Available and free memory, swap use and composition
+    pub(crate) zswap:     bool,  // Compressed swap cache in RAM
     pub(crate) zram:      bool,  // Compressed swap in RAM
     pub(crate) processes: bool,  // Anonymous RAM and swap by program
 }
@@ -194,7 +195,7 @@ impl Default for CpuConfig {
 
 impl Default for MemoryConfig {
     fn default() -> Self {
-        Self { enable: true, pressure: true, paging: true, reclaim: true, ram: true, zram: true, processes: true }
+        Self { enable: true, pressure: true, paging: true, reclaim: true, ram: true, zswap: true, zram: true, processes: true }
     }
 }
 

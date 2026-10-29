@@ -14,7 +14,7 @@ not how busy something is.
 | Section | Headline | Tooltip |
 | --- | --- | --- |
 | `cpu` | 1-minute load · CPU pressure | load, pressure, interrupt pressure, utilization, context switches, frequency scaling, fans, CPU temperature, Intel thermal and ACPI throttling |
-| `memory` | memory pressure (all tasks stalled) · available RAM | pressure, swap and paging, refaults, reclaim, compaction, OOM kills, RAM composition, zram, anonymous RAM and swap by program |
+| `memory` | memory pressure (all tasks stalled) · available RAM | pressure, swap and paging, refaults, reclaim, compaction, OOM kills, RAM composition, zswap, zram, anonymous RAM and swap by program |
 | `disks` | average requests queued on local disks | per-disk busy time, queue, latency and throughput, dirty pages, root filesystem, I/O pressure, tasks blocked in D state |
 | `network` | average NAS (SMB) requests outstanding | NAS request rate and latency, TCP retransmissions and timeouts, listen and buffer errors, interfaces, link use |
 | `gpu` | GPU utilization · VRAM | utilization, encoder and decoder, VRAM, time under each clock-limit policy, clocks, power, temperature headroom, PCIe, VRAM by process |
@@ -138,7 +138,7 @@ heading = "#89b4fa"
 [cpu]                       # load, pressure, interrupt_pressure, utilization, scheduler, frequency,
 fans = false                # scaling, fans, temperature, thermal_throttling, acpi_throttling
 
-[memory]                    # pressure, paging, reclaim, ram, zram, processes
+[memory]                    # pressure, paging, reclaim, ram, zswap, zram, processes
 
 [disks]                     # devices, dirty_pages, root_filesystem, pressure, blocked_tasks
 
