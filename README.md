@@ -17,7 +17,7 @@ not how busy something is.
 | `memory` | memory pressure (all tasks stalled) · available RAM | pressure, swap and paging, refaults, reclaim, compaction, OOM kills, RAM composition, zswap, zram, anonymous RAM and swap by program |
 | `disks` | average requests queued on local disks | per-disk busy time, queue, latency and throughput, dirty pages, root filesystem, I/O pressure, tasks blocked in D state |
 | `network` | average NAS (SMB) requests outstanding | NAS request rate and latency, TCP retransmissions and timeouts, listen and buffer errors, interfaces, link use |
-| `gpu` | GPU utilization · VRAM | utilization, encoder and decoder, VRAM, time under each clock-limit policy, clocks, power, temperature headroom, PCIe, VRAM by process |
+| `gpu` | GPU utilization · available VRAM | utilization, encoder and decoder, VRAM, time under each clock-limit policy, clocks, power, temperature headroom, PCIe, VRAM by process |
 
 Each figure that can show strain is coloured green, amber or red against its
 own threshold, and the module's CSS class (`ok`, `warning` or `critical`)

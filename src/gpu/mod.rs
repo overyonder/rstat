@@ -1,5 +1,5 @@
 //! NVIDIA GPU section, read through NVML (the library nvidia-smi itself uses), loaded once while the
-//! section is watched. Headline: GPU utilization · VRAM use.
+//! section is watched. Headline: GPU utilization · available VRAM.
 
 use std::time::{Duration, Instant};
 
@@ -331,7 +331,7 @@ impl GpuSampler {
             headline
                 .high(gpu_percent, &format!("{gpu_percent:.0}%"), 95.0, 101.0)
                 .label(" · ")
-                .high(vram_percent, &format!("{:.1}G", used / 1024.0), 90.0, 97.0);
+                .high(vram_percent, &format!("{:.1}G", (capacity - used).max(0.0) / 1024.0), 90.0, 97.0);
         }
         let severity = tooltip.worst_severity().max(headline.worst_severity());
         WaybarReport::new(headline.into_text(), tooltip.into_text(), severity)
