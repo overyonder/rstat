@@ -13,7 +13,13 @@ pub enum Section {
 }
 
 impl Section {
-    pub const ALL: [Self; 5] = [Self::Cpu, Self::Memory, Self::Disks, Self::Network, Self::Gpu];
+    pub const ALL: [Self; 5] = [
+        Self::Cpu,
+        Self::Memory,
+        Self::Disks,
+        Self::Network,
+        Self::Gpu,
+    ];
 
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
@@ -35,5 +41,7 @@ impl Section {
 /// The daemon's listening socket: `$XDG_RUNTIME_DIR/rstat.sock`.
 #[must_use]
 pub fn daemon_socket_path() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from).join("rstat.sock")
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from)
+        .join("rstat.sock")
 }

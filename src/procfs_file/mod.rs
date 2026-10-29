@@ -6,13 +6,16 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 pub(crate) struct ProcfsFile {
-    file:   File,
-    buffer: Vec<u8>,  // Reused across reads; grows to the largest content seen
+    file: File,
+    buffer: Vec<u8>, // Reused across reads; grows to the largest content seen
 }
 
 impl ProcfsFile {
     pub(crate) fn open(path: impl AsRef<Path>) -> Option<Self> {
-        File::open(path).ok().map(|file| Self { file, buffer: Vec::with_capacity(4096) })
+        File::open(path).ok().map(|file| Self {
+            file,
+            buffer: Vec::with_capacity(4096),
+        })
     }
 
     /// The file's whole current content, or an empty string if the read fails.
@@ -27,15 +30,19 @@ impl ProcfsFile {
             let start = self.buffer.len();
             self.buffer.resize(start + spare, 0);
             match self.file.read_at(&mut self.buffer[start..], offset) {
-                Ok(0) | Err(_) => {
+                Ok(0) => {
                     self.buffer.truncate(start);
+                    break;
+                }
+                Err(_) => {
+                    self.buffer.clear();
                     break;
                 }
                 Ok(read) => {
                     self.buffer.truncate(start + read);
                     offset += read as u64;
                     if read < spare {
-                        break;  // A short read is the end; reading on would make the kernel regenerate the file
+                        break; // A short read is the end; reading on would make the kernel regenerate the file
                     }
                 }
             }
@@ -51,21 +58,23 @@ impl ProcfsFile {
 
 /// Reads a small file once, for values that change rarely or are read only occasionally.
 pub(crate) fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
-    std::fs::read_to_string(path).ok().map(|text| text.trim().to_owned())
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|text| text.trim().to_owned())
 }
 
-/// The 10s, 60s and 300s averages and the cumulative total of one PSI line (`some` or `full`).
-#[derive(Clone, Copy, Default)]
+/// The 10s, 60s and 300s averages of one PSI line (`some` or `full`).
+#[derive(Clone, Copy)]
 pub(crate) struct PressureLine {
-    pub(crate) ten_seconds:   f64,
-    pub(crate) one_minute:    f64,
-    pub(crate) five_minutes:  f64,
+    pub(crate) ten_seconds: f64,
+    pub(crate) one_minute: f64,
+    pub(crate) five_minutes: f64,
 }
 
 /// Parses `/proc/pressure/*`: returns the `some` and `full` lines.
-pub(crate) fn parse_pressure(text: &str) -> (PressureLine, PressureLine) {
-    let mut some = PressureLine::default();
-    let mut full = PressureLine::default();
+pub(crate) fn parse_pressure(text: &str) -> (Option<PressureLine>, Option<PressureLine>) {
+    let mut some = None;
+    let mut full = None;
     for line in text.lines() {
         let mut fields = line.split_whitespace();
         let target = match fields.next() {
@@ -73,34 +82,51 @@ pub(crate) fn parse_pressure(text: &str) -> (PressureLine, PressureLine) {
             Some("full") => &mut full,
             _ => continue,
         };
+        let (mut ten_seconds, mut one_minute, mut five_minutes) = (None, None, None);
         for field in fields {
-            let Some((key, value)) = field.split_once('=') else { continue };
-            let Ok(value) = value.parse::<f64>() else { continue };
+            let Some((key, value)) = field.split_once('=') else {
+                continue;
+            };
+            let Ok(value) = value.parse::<f64>() else {
+                continue;
+            };
+            if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+                continue;
+            }
             match key {
-                "avg10" => target.ten_seconds = value,
-                "avg60" => target.one_minute = value,
-                "avg300" => target.five_minutes = value,
+                "avg10" => ten_seconds = Some(value),
+                "avg60" => one_minute = Some(value),
+                "avg300" => five_minutes = Some(value),
                 _ => {}
             }
         }
+        *target = match (ten_seconds, one_minute, five_minutes) {
+            (Some(ten_seconds), Some(one_minute), Some(five_minutes)) => Some(PressureLine {
+                ten_seconds,
+                one_minute,
+                five_minutes,
+            }),
+            _ => None,
+        };
     }
     (some, full)
 }
 
 /// Looks up `name` in `key value` lines such as /proc/vmstat, or `key: value kB` lines such as
 /// /proc/meminfo (the trailing colon is ignored).
-pub(crate) fn keyed_value(text: &str, name: &str) -> u64 {
-    text.lines()
-        .find_map(|line| {
-            let mut fields = line.split_whitespace();
-            (fields.next()?.trim_end_matches(':') == name).then(|| fields.next()?.parse().ok())?
-        })
-        .unwrap_or(0)
+pub(crate) fn keyed_value(text: &str, name: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        (fields.next()?.trim_end_matches(':') == name).then(|| fields.next()?.parse().ok())?
+    })
 }
 
 /// Splits a `/proc/PID/stat` or `/proc/PID/task/TID/stat` line into the command name and the fields
 /// after it, starting with the state. The name is parenthesised and may contain spaces or parentheses.
 pub(crate) fn split_process_stat(stat: &str) -> Option<(&str, std::str::SplitWhitespace<'_>)> {
     let (open, close) = (stat.find('(')?, stat.rfind(')')?);
-    Some((stat.get(open + 1..close)?, stat.get(close + 1..)?.split_whitespace()))
+    Some((
+        stat.get(open + 1..close)?,
+        stat.get(close + 1..)?.split_whitespace(),
+    ))
 }

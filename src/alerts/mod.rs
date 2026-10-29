@@ -20,21 +20,21 @@ use crate::section::Section;
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Figure {
     #[serde(rename = "cpu.load")]
-    CpuLoad,  // 1-minute load average
+    CpuLoad, // 1-minute load average
     #[serde(rename = "cpu.pressure")]
-    CpuPressure,  // Percent of time some tasks waited for a CPU, over 10 s
+    CpuPressure, // Percent of time some tasks waited for a CPU, over 10 s
     #[serde(rename = "memory.pressure_some")]
-    MemoryPressureSome,  // Percent of time some tasks stalled on memory, over 10 s
+    MemoryPressureSome, // Percent of time some tasks stalled on memory, over 10 s
     #[serde(rename = "memory.pressure_full")]
-    MemoryPressureFull,  // Percent of time all non-idle tasks stalled on memory, over 10 s
+    MemoryPressureFull, // Full memory PSI: productive capacity lost to stalls, over 10 s
     #[serde(rename = "disks.queue")]
-    DisksQueue,  // Average requests queued on local disks
+    DisksQueue, // Average requests queued on local disks
     #[serde(rename = "disks.pressure_some")]
-    DisksPressureSome,  // Percent of time some tasks stalled on I/O, over 10 s
+    DisksPressureSome, // Percent of time some tasks stalled on I/O, over 10 s
     #[serde(rename = "disks.pressure_full")]
-    DisksPressureFull,  // Percent of time all non-idle tasks stalled on I/O, over 10 s
+    DisksPressureFull, // Full I/O PSI: productive capacity lost to stalls, over 10 s
     #[serde(rename = "network.nas_wait")]
-    NetworkNasWait,  // Average NAS (SMB) requests outstanding
+    NetworkNasWait, // Current SMB requests on the wire
 }
 
 impl Figure {
@@ -67,7 +67,9 @@ impl Figure {
             Self::CpuLoad => Measure::RunnableOrBlockedThreads,
             Self::CpuPressure => Measure::CpuSeconds,
             Self::MemoryPressureSome | Self::MemoryPressureFull => Measure::AnonymousMemoryBytes,
-            Self::DisksQueue | Self::DisksPressureSome | Self::DisksPressureFull => Measure::BlockIoBytes,
+            Self::DisksQueue | Self::DisksPressureSome | Self::DisksPressureFull => {
+                Measure::BlockIoBytes
+            }
             Self::NetworkNasWait => Measure::BlockedThreads,
         }
     }
@@ -78,18 +80,26 @@ const OFFENDERS_REPORTED: usize = 5;
 
 enum AlertState {
     Below,
-    Above { since: Instant, window: MeasureWindow },
-    Fired { at: Instant },
+    Above {
+        since: Instant,
+        window: MeasureWindow,
+    },
+    Fired {
+        at: Instant,
+    },
 }
 
 pub(crate) struct Alert {
     config: AlertConfig,
-    state:  AlertState,
+    state: AlertState,
 }
 
 impl Alert {
     pub(crate) const fn new(config: AlertConfig) -> Self {
-        Self { config, state: AlertState::Below }
+        Self {
+            config,
+            state: AlertState::Below,
+        }
     }
 
     pub(crate) const fn section(&self) -> Section {
@@ -99,12 +109,21 @@ impl Alert {
     /// Advances the alert with the figures its section reported this sample, and runs its command
     /// once the figure has stayed above the threshold for the sustain period.
     pub(crate) fn observe(&mut self, figures: &[(Figure, f64)]) {
-        let Some(value) = figures.iter().find(|(figure, _)| *figure == self.config.figure).map(|(_, value)| *value) else { return };
+        let Some(value) = figures
+            .iter()
+            .find(|(figure, _)| *figure == self.config.figure)
+            .map(|(_, value)| *value)
+        else {
+            return;
+        };
         let now = Instant::now();
         let above = value > self.config.above;
         self.state = match std::mem::replace(&mut self.state, AlertState::Below) {
             AlertState::Below | AlertState::Above { .. } if !above => AlertState::Below,
-            AlertState::Below => AlertState::Above { since: now, window: MeasureWindow::start(self.config.figure.measure()) },
+            AlertState::Below => AlertState::Above {
+                since: now,
+                window: MeasureWindow::start(self.config.figure.measure()),
+            },
             AlertState::Above { since, mut window } => {
                 window.add_sample();
                 if now.duration_since(since) >= Duration::from_secs(self.config.sustain_seconds) {
@@ -114,7 +133,11 @@ impl Alert {
                     AlertState::Above { since, window }
                 }
             }
-            AlertState::Fired { at } if now.duration_since(at) < Duration::from_secs(self.config.repeat_seconds) => AlertState::Fired { at },
+            AlertState::Fired { at }
+                if now.duration_since(at) < Duration::from_secs(self.config.repeat_seconds) =>
+            {
+                AlertState::Fired { at }
+            }
             AlertState::Fired { .. } => AlertState::Below,
         };
     }
@@ -132,8 +155,13 @@ impl Alert {
             "offenders": offenders,
         })
         .to_string();
-        let Some((program, arguments)) = self.config.command.split_first() else { return };
-        let child = Command::new(program).args(arguments).stdin(Stdio::piped()).spawn();
+        let Some((program, arguments)) = self.config.command.split_first() else {
+            return;
+        };
+        let child = Command::new(program)
+            .args(arguments)
+            .stdin(Stdio::piped())
+            .spawn();
         let figure = self.config.figure.name();
         match child {
             Ok(mut child) => {
@@ -142,13 +170,19 @@ impl Alert {
                         let _ = stdin.write_all(description.as_bytes());
                     }
                     match child.wait() {
-                        Ok(status) if !status.success() => eprintln!("rstat: the {figure} alert command exited with {status}"),
-                        Err(error) => eprintln!("rstat: the {figure} alert command could not be waited for: {error}"),
+                        Ok(status) if !status.success() => {
+                            eprintln!("rstat: the {figure} alert command exited with {status}");
+                        }
+                        Err(error) => eprintln!(
+                            "rstat: the {figure} alert command could not be waited for: {error}"
+                        ),
                         Ok(_) => {}
                     }
                 });
             }
-            Err(error) => eprintln!("rstat: the {figure} alert command could not be started: {error}"),
+            Err(error) => {
+                eprintln!("rstat: the {figure} alert command could not be started: {error}");
+            }
         }
     }
 }

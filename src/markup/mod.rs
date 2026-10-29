@@ -49,23 +49,23 @@ impl Severity {
 }
 
 pub(crate) struct MarkupColors {
-    ok:       String,
-    warning:  String,
+    ok: String,
+    warning: String,
     critical: String,
-    label:    String,
-    value:    String,
-    heading:  String,
+    label: String,
+    value: String,
+    heading: String,
 }
 
 impl MarkupColors {
     pub(crate) fn from_config(colors: &crate::config::ColorConfig) -> Self {
         Self {
-            ok:       colors.ok.clone(),
-            warning:  colors.warning.clone(),
+            ok: colors.ok.clone(),
+            warning: colors.warning.clone(),
             critical: colors.critical.clone(),
-            label:    colors.label.clone(),
-            value:    colors.value.clone(),
-            heading:  colors.heading.clone(),
+            label: colors.label.clone(),
+            value: colors.value.clone(),
+            heading: colors.heading.clone(),
         }
     }
 
@@ -80,14 +80,18 @@ impl MarkupColors {
 
 /// Builds markup text, tracking the worst severity of the strain figures written into it.
 pub(crate) struct Markup<'colors> {
-    colors:          &'colors MarkupColors,
-    text:            String,
-    worst_severity:  Severity,
+    colors: &'colors MarkupColors,
+    text: String,
+    worst_severity: Severity,
 }
 
 impl<'colors> Markup<'colors> {
     pub(crate) const fn new(colors: &'colors MarkupColors) -> Self {
-        Self { colors, text: String::new(), worst_severity: Severity::Ok }
+        Self {
+            colors,
+            text: String::new(),
+            worst_severity: Severity::Ok,
+        }
     }
 
     fn span(&mut self, color: &str, text: &str) -> &mut Self {
@@ -132,11 +136,23 @@ impl<'colors> Markup<'colors> {
         self.span(&color, text)
     }
 
-    pub(crate) fn high(&mut self, figure: f64, text: &str, warning: f64, critical: f64) -> &mut Self {
+    pub(crate) fn high(
+        &mut self,
+        figure: f64,
+        text: &str,
+        warning: f64,
+        critical: f64,
+    ) -> &mut Self {
         self.toned(Severity::of_high(figure, warning, critical), text)
     }
 
-    pub(crate) fn low(&mut self, figure: f64, text: &str, warning: f64, critical: f64) -> &mut Self {
+    pub(crate) fn low(
+        &mut self,
+        figure: f64,
+        text: &str,
+        warning: f64,
+        critical: f64,
+    ) -> &mut Self {
         self.toned(Severity::of_low(figure, warning, critical), text)
     }
 
@@ -172,30 +188,42 @@ fn escape_into(output: &mut String, text: &str) {
 /// The line Waybar reads for one section.
 pub(crate) struct WaybarReport {
     pub(crate) headline: String,
-    pub(crate) tooltip:  String,
-    pub(crate) class:    &'static str,  // ok, warning or critical, or a section-specific state
-    pub(crate) alt:      &'static str,  // Selects the module's format icon; empty when unused
-    pub(crate) figures:  Vec<(Figure, f64)>,  // The section's figures alerts can watch; not sent to Waybar
+    pub(crate) tooltip: String,
+    pub(crate) class: &'static str, // ok, warning or critical, or a section-specific state
+    pub(crate) alt: &'static str,   // Selects the module's format icon; empty when unused
+    pub(crate) figures: Vec<(Figure, f64)>, // The section's figures alerts can watch; not sent to Waybar
 }
 
 impl WaybarReport {
     pub(crate) const fn new(headline: String, tooltip: String, severity: Severity) -> Self {
-        Self { headline, tooltip, class: severity.class_name(), alt: "", figures: Vec::new() }
+        Self {
+            headline,
+            tooltip,
+            class: severity.class_name(),
+            alt: "",
+            figures: Vec::new(),
+        }
     }
 
     pub(crate) fn collecting_first_sample() -> Self {
         Self {
             headline: "…".to_owned(),
-            tooltip:  "Collecting a first sample; figures appear on the next refresh.".to_owned(),
-            class:    "ok",
-            alt:      "",
-            figures:  Vec::new(),
+            tooltip: "Collecting a first sample; figures appear on the next refresh.".to_owned(),
+            class: "ok",
+            alt: "",
+            figures: Vec::new(),
         }
     }
 
     /// For a section whose counters can't be read at all.
     pub(crate) fn unavailable(reason: &str) -> Self {
-        Self { headline: "N/A".to_owned(), tooltip: reason.to_owned(), class: "ok", alt: "", figures: Vec::new() }
+        Self {
+            headline: "N/A".to_owned(),
+            tooltip: reason.to_owned(),
+            class: "ok",
+            alt: "",
+            figures: Vec::new(),
+        }
     }
 
     pub(crate) fn to_json_line(&self) -> String {

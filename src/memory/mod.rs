@@ -1,5 +1,5 @@
 //! Memory section: pressure, paging and reclaim, RAM composition including zswap and zram, and anonymous memory
-//! by program. Headline: memory pressure (all tasks stalled, 10s) · available RAM.
+//! by program. Headline: full memory pressure (10s) · available RAM.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -17,20 +17,23 @@ const GIB: f64 = 1_073_741_824.0;
 const MIB: f64 = 1_048_576.0;
 
 pub(crate) struct MemorySampler {
-    meminfo:   ProcfsFile,
-    vmstat:    ProcfsFile,
-    pressure:  ProcfsFile,
-    zram:      Vec<ProcfsFile>,  // mm_stat per zram device, in bytes
-    processes: Option<ProcessMemoryWalk>,  // Present while the process table is shown
+    meminfo: ProcfsFile,
+    vmstat: ProcfsFile,
+    pressure: ProcfsFile,
+    zram: Vec<ProcfsFile>,                // mm_stat per zram device, in bytes
+    processes: Option<ProcessMemoryWalk>, // Present while the process table is shown
     page_size: f64,
-    previous:  Option<(Instant, HashMap<String, u64>)>,
-    items:     MemoryConfig,
+    previous: Option<(Instant, HashMap<String, u64>)>,
+    items: MemoryConfig,
 }
 
 impl MemorySampler {
     pub(crate) fn open(items: MemoryConfig) -> std::io::Result<Self> {
-        let open = |path: &str| ProcfsFile::open(path).ok_or_else(|| std::io::Error::other(format!("cannot open {path}")));
-        let zram = if items.ram || items.zram {
+        let open = |path: &str| {
+            ProcfsFile::open(path)
+                .ok_or_else(|| std::io::Error::other(format!("cannot open {path}")))
+        };
+        let zram = if items.zram {
             std::fs::read_dir("/sys/block")
                 .into_iter()
                 .flatten()
@@ -42,13 +45,16 @@ impl MemorySampler {
             Vec::new()
         };
         Ok(Self {
-            meminfo:   open("/proc/meminfo")?,
-            vmstat:    open("/proc/vmstat")?,
-            pressure:  open("/proc/pressure/memory")?,
+            meminfo: open("/proc/meminfo")?,
+            vmstat: open("/proc/vmstat")?,
+            pressure: open("/proc/pressure/memory")?,
             zram,
             processes: items.processes.then(ProcessMemoryWalk::new),
-            page_size: nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE).ok().flatten().unwrap_or(4096) as f64,
-            previous:  None,
+            page_size: nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE)
+                .ok()
+                .flatten()
+                .unwrap_or(4096) as f64,
+            previous: None,
             items,
         })
     }
@@ -64,31 +70,94 @@ impl MemorySampler {
                 Some((name.to_owned(), value.trim().parse().ok()?))
             })
             .collect();
+        if [
+            "pswpin",
+            "pswpout",
+            "workingset_refault_anon",
+            "workingset_refault_file",
+            "pgmajfault",
+            "compact_stall",
+            "pgscan_direct",
+            "pgscan_kswapd",
+            "oom_kill",
+        ]
+        .iter()
+        .any(|name| !counters.contains_key(*name))
+            || !counters.keys().any(|name| name.starts_with("allocstall_"))
+        {
+            return WaybarReport::unavailable("Memory VM counters unavailable");
+        }
         let Some((previous_time, previous)) = self.previous.replace((now, counters.clone())) else {
             return WaybarReport::collecting_first_sample();
         };
         let seconds = now.duration_since(previous_time).as_secs_f64();
-        let delta = |name: &str| counters.get(name).copied().unwrap_or(0).saturating_sub(previous.get(name).copied().unwrap_or(0)) as f64;
+        let delta = |name: &str| {
+            counters
+                .get(name)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(previous.get(name).copied().unwrap_or(0)) as f64
+        };
         let per_second = |name: &str| delta(name) / seconds;
-        let allocation_stalls: f64 = counters.keys().filter(|name| name.starts_with("allocstall_")).map(|name| per_second(name)).sum();
+        let allocation_stalls: f64 = counters
+            .keys()
+            .filter(|name| name.starts_with("allocstall_"))
+            .map(|name| per_second(name))
+            .sum();
 
         let meminfo = self.meminfo.read().to_owned();
-        let bytes = |name: &str| keyed_value(&meminfo, name) as f64 * 1024.0;
+        if [
+            "MemTotal",
+            "MemAvailable",
+            "MemFree",
+            "AnonPages",
+            "Cached",
+            "Buffers",
+            "Slab",
+            "PageTables",
+            "KernelStack",
+            "Percpu",
+            "SwapCached",
+            "SwapTotal",
+            "SwapFree",
+        ]
+        .iter()
+        .any(|name| keyed_value(&meminfo, name).is_none())
+        {
+            return WaybarReport::unavailable("RAM counters unavailable");
+        }
+        let bytes = |name: &str| keyed_value(&meminfo, name).unwrap_or(0) as f64 * 1024.0;
         let zswap_physical = bytes("Zswap");
         let zswap_logical = bytes("Zswapped");
         let (mut zram_logical, mut zram_payload, mut zram_physical) = (0.0, 0.0, 0.0);
+        let mut zram_available = true;
         for device in &mut self.zram {
-            let fields: Vec<f64> = device.read().split_whitespace().take(3).filter_map(|field| field.parse().ok()).collect();
-            if let [logical, payload, physical] = fields[..] {
+            let fields = device
+                .read()
+                .split_whitespace()
+                .take(3)
+                .map(str::parse::<f64>)
+                .collect::<Result<Vec<_>, _>>();
+            if let Ok(fields) = fields
+                && let [logical, payload, physical] = fields[..]
+            {
                 zram_logical += logical;
                 zram_payload += payload;
                 zram_physical += physical;
+            } else {
+                zram_available = false;
             }
         }
-        let (some, full) = parse_pressure(self.pressure.read());
+        let (Some(some), Some(full)) = parse_pressure(self.pressure.read()) else {
+            return WaybarReport::unavailable("Memory pressure counters unavailable");
+        };
         let total = bytes("MemTotal");
         let available = bytes("MemAvailable");
-        let available_percent = if total > 0.0 { 100.0 * available / total } else { 0.0 };
+        let available_percent = if total > 0.0 {
+            100.0 * available / total
+        } else {
+            0.0
+        };
         let oom_kills = delta("oom_kill");
 
         let items = self.items;
@@ -97,21 +166,50 @@ impl MemorySampler {
             tooltip.heading("Pressure (10s / 60s / 300s)");
             tooltip
                 .line()
-                .label("Some tasks stalled: ")
-                .high(some.ten_seconds, &format!("{:.2}", some.ten_seconds), 10.0, 40.0)
+                .label("Some pressure (task stalls): ")
+                .high(
+                    some.ten_seconds,
+                    &format!("{:.2}", some.ten_seconds),
+                    10.0,
+                    40.0,
+                )
                 .label(" / ")
-                .high(some.one_minute, &format!("{:.2}", some.one_minute), 10.0, 40.0)
+                .high(
+                    some.one_minute,
+                    &format!("{:.2}", some.one_minute),
+                    10.0,
+                    40.0,
+                )
                 .label(" / ")
-                .high(some.five_minutes, &format!("{:.2}%", some.five_minutes), 10.0, 40.0);
+                .high(
+                    some.five_minutes,
+                    &format!("{:.2}%", some.five_minutes),
+                    10.0,
+                    40.0,
+                );
             tooltip
                 .line()
-                .label("All tasks stalled: ")
-                .high(full.ten_seconds, &format!("{:.2}", full.ten_seconds), 2.0, 10.0)
+                .label("Full pressure (lost productive capacity): ")
+                .high(
+                    full.ten_seconds,
+                    &format!("{:.2}", full.ten_seconds),
+                    2.0,
+                    10.0,
+                )
                 .label(" / ")
-                .high(full.one_minute, &format!("{:.2}", full.one_minute), 2.0, 10.0)
+                .high(
+                    full.one_minute,
+                    &format!("{:.2}", full.one_minute),
+                    2.0,
+                    10.0,
+                )
                 .label(" / ")
-                .high(full.five_minutes, &format!("{:.2}%", full.five_minutes), 2.0, 10.0);
-
+                .high(
+                    full.five_minutes,
+                    &format!("{:.2}%", full.five_minutes),
+                    2.0,
+                    10.0,
+                );
         }
 
         let swap_in = per_second("pswpin") * self.page_size / MIB;
@@ -131,24 +229,53 @@ impl MemorySampler {
                 .label(" · swap-out: ")
                 .high(swap_out, &format!("{swap_out:.2} MiB/s"), 1.0, 20.0);
             // Reading a newly opened file faults too, so major faults alone aren't strain; refaults are
-            tooltip.line().label("Major page faults: ").value(&format!("{major_faults:.0}/s"));
+            tooltip
+                .line()
+                .label("Major page faults: ")
+                .value(&format!("{major_faults:.0}/s"));
             tooltip
                 .line()
                 .label("Refaults of evicted pages: anonymous ")
-                .high(refault_anonymous, &format!("{refault_anonymous:.0}/s"), 1000.0, 10000.0)
+                .high(
+                    refault_anonymous,
+                    &format!("{refault_anonymous:.0}/s"),
+                    1000.0,
+                    10000.0,
+                )
                 .label(", file ")
-                .high(refault_file, &format!("{refault_file:.0}/s"), 1000.0, 10000.0);
+                .high(
+                    refault_file,
+                    &format!("{refault_file:.0}/s"),
+                    1000.0,
+                    10000.0,
+                );
         }
         if items.reclaim {
             tooltip
                 .line()
                 .label("Direct reclaim: ")
-                .high(allocation_stalls, &format!("{allocation_stalls:.1} stalls/s"), 1.0, 10.0)
+                .high(
+                    allocation_stalls,
+                    &format!("{allocation_stalls:.1} stalls/s"),
+                    1.0,
+                    10.0,
+                )
                 .label(", ")
-                .value(&format!("{:.0} pages scanned/s", per_second("pgscan_direct")))
+                .value(&format!(
+                    "{:.0} pages scanned/s",
+                    per_second("pgscan_direct")
+                ))
                 .label(" · background (kswapd): ")
-                .value(&format!("{:.0} pages scanned/s", per_second("pgscan_kswapd")));
-            tooltip.line().label("Compaction stalls: ").high(compaction_stalls, &format!("{compaction_stalls:.1}/s"), 1.0, 10.0);
+                .value(&format!(
+                    "{:.0} pages scanned/s",
+                    per_second("pgscan_kswapd")
+                ));
+            tooltip.line().label("Compaction stalls: ").high(
+                compaction_stalls,
+                &format!("{compaction_stalls:.1}/s"),
+                1.0,
+                10.0,
+            );
             tooltip
                 .line()
                 .label("OOM kills: ")
@@ -158,10 +285,9 @@ impl MemorySampler {
                 .label(" since boot");
         }
 
-        let outside_compressed_swap = total - bytes("MemFree") - zswap_physical - zram_physical;
         let cache = bytes("Cached") + bytes("Buffers");
-        let kernel_other = bytes("PageTables") + bytes("SecPageTables") + bytes("KernelStack") + bytes("Percpu");
-        let other = outside_compressed_swap - bytes("AnonPages") - cache - bytes("Slab") - kernel_other - bytes("SwapCached");
+        let kernel_other =
+            bytes("PageTables") + bytes("SecPageTables") + bytes("KernelStack") + bytes("Percpu");
         if items.ram || items.zswap || items.zram {
             tooltip.heading("RAM");
         }
@@ -169,43 +295,68 @@ impl MemorySampler {
             tooltip
                 .line()
                 .label("Available (includes reclaimable): ")
-                .low(available / GIB, &format!("{:.2} GiB", available / GIB), total * 0.15 / GIB, total * 0.05 / GIB)
+                .low(
+                    available / GIB,
+                    &format!("{:.2} GiB", available / GIB),
+                    total * 0.15 / GIB,
+                    total * 0.05 / GIB,
+                )
                 .label(" of ")
                 .value(&format!("{:.2} GiB", total / GIB))
                 .label(" (")
-                .low(available_percent, &format!("{available_percent:.0}%"), 15.0, 5.0)
+                .low(
+                    available_percent,
+                    &format!("{available_percent:.0}%"),
+                    15.0,
+                    5.0,
+                )
                 .label(")");
             tooltip
                 .line()
                 .label("Free physical: ")
                 .value(&format!("{:.2} GiB", bytes("MemFree") / GIB))
                 .label(" · swap used: ")
-                .value(&format!("{:.2} of {:.2} GiB", (bytes("SwapTotal") - bytes("SwapFree")) / GIB, bytes("SwapTotal") / GIB));
-            tooltip.line().label("In use outside compressed swap: ").value(&format!("{:.2} GiB", outside_compressed_swap / GIB));
+                .value(&format!(
+                    "{:.2} of {:.2} GiB",
+                    (bytes("SwapTotal") - bytes("SwapFree")) / GIB,
+                    bytes("SwapTotal") / GIB
+                ));
             tooltip
                 .line()
-                .label("  anonymous ")
+                .label("Physical in use: ")
+                .value(&format!("{:.2} GiB", (total - bytes("MemFree")) / GIB));
+            tooltip
+                .line()
+                .label("Anonymous resident: ")
                 .value(&format!("{:.2}", bytes("AnonPages") / GIB))
-                .label(" · file cache and shared ")
+                .label(" · file cache, buffers and shared ")
                 .value(&format!("{:.2}", cache / GIB))
                 .label(" · slab ")
                 .value(&format!("{:.2}", bytes("Slab") / GIB))
                 .label(" · page tables, stacks, per-CPU ")
                 .value(&format!("{:.2}", kernel_other / GIB))
-                .label(" · swap cache ")
-                .value(&format!("{:.2}", bytes("SwapCached") / GIB))
-                .label(" · other ")
-                .value(&format!("{:.2} GiB", other / GIB));
-        }
-        if items.zswap && meminfo.lines().any(|line| line.starts_with("Zswap:")) {
+                .label(" GiB");
             tooltip
                 .line()
-                .label("Zswap: ")
-                .value(&format!("{:.2} GiB", zswap_logical / GIB))
-                .label(" stored in ")
-                .value(&format!("{:.2} GiB", zswap_physical / GIB));
+                .label("Resident swap cache: ")
+                .value(&format!("{:.2} GiB", bytes("SwapCached") / GIB));
         }
-        if items.zram && !self.zram.is_empty() {
+        if items.zswap && meminfo.lines().any(|line| line.starts_with("Zswap:")) {
+            tooltip.line().label("Zswap: ");
+            if keyed_value(&meminfo, "Zswap").is_some()
+                && keyed_value(&meminfo, "Zswapped").is_some()
+            {
+                tooltip
+                    .value(&format!("{:.2} GiB", zswap_logical / GIB))
+                    .label(" stored in ")
+                    .value(&format!("{:.2} GiB", zswap_physical / GIB));
+            } else {
+                tooltip.value("N/A");
+            }
+        }
+        if items.zram && !self.zram.is_empty() && !zram_available {
+            tooltip.line().label("Zram: ").value("N/A");
+        } else if items.zram && !self.zram.is_empty() {
             tooltip
                 .line()
                 .label("Zram: ")
@@ -224,12 +375,32 @@ impl MemorySampler {
 
         let mut headline = Markup::new(colors);
         headline
-            .high(full.ten_seconds, &format!("{:.1}%", full.ten_seconds), 2.0, 10.0)
+            .high(
+                full.ten_seconds,
+                &format!("{:.1}%", full.ten_seconds),
+                2.0,
+                10.0,
+            )
             .label(" · ")
-            .low(available / GIB, &format!("{:.1}G", available / GIB), total * 0.15 / GIB, total * 0.05 / GIB);
-        let severity = if oom_kills > 0.0 { Severity::Critical } else { tooltip.worst_severity().max(headline.worst_severity()) };
-        let figures = vec![(Figure::MemoryPressureSome, some.ten_seconds), (Figure::MemoryPressureFull, full.ten_seconds)];
-        WaybarReport { figures, ..WaybarReport::new(headline.into_text(), tooltip.into_text(), severity) }
+            .low(
+                available / GIB,
+                &format!("{:.1}G", available / GIB),
+                total * 0.15 / GIB,
+                total * 0.05 / GIB,
+            );
+        let severity = if oom_kills > 0.0 {
+            Severity::Critical
+        } else {
+            tooltip.worst_severity().max(headline.worst_severity())
+        };
+        let figures = vec![
+            (Figure::MemoryPressureSome, some.ten_seconds),
+            (Figure::MemoryPressureFull, full.ten_seconds),
+        ];
+        WaybarReport {
+            figures,
+            ..WaybarReport::new(headline.into_text(), tooltip.into_text(), severity)
+        }
     }
 }
 
@@ -237,15 +408,29 @@ impl MemorySampler {
 /// the section's severity.
 fn write_process_memory_rows(tooltip: &mut Markup<'_>, owners: &[OwnerAnonymousMemory]) {
     let gib = |kib: u64| kib as f64 / 1_048_576.0;
-    tooltip.heading("Processes: anonymous RAM + swap, GiB");
-    tooltip.line().label(&format!("{:<28} {:>6} {:>6} {:>6}", "Program (processes)", "RAM", "Swap", "Total"));
+    tooltip.heading("Processes: summed anonymous RSS + swap, GiB");
+    tooltip.line().label(&format!(
+        "{:<28} {:>6} {:>6} {:>6}",
+        "Program (processes)", "RSS", "Swap", "Sum"
+    ));
     for owner in owners.iter().take(LISTED_OWNERS) {
-        let name: String = format!("{} ({})", owner.name, owner.process_count).chars().take(28).collect();
+        let name: String = format!("{} ({})", owner.name, owner.process_count)
+            .chars()
+            .take(28)
+            .collect();
         let (ram, swap) = (gib(owner.resident_kib), gib(owner.swapped_kib));
-        tooltip.line().value(&format!("{name:<28} {ram:>6.2} {swap:>6.2} {:>6.2}", ram + swap));
+        tooltip.line().value(&format!(
+            "{name:<28} {ram:>6.2} {swap:>6.2} {:>6.2}",
+            ram + swap
+        ));
     }
-    let other: u64 = owners.iter().skip(LISTED_OWNERS).map(|owner| owner.resident_kib + owner.swapped_kib).sum();
-    tooltip.line().label("Other processes: ").value(&format!("{:.2} GiB", gib(other)));
-    tooltip.line().label("Swap shared by forked processes counts in each, so it can overstate.");
-    tooltip.line().label("File-backed pages are included in file cache, not these rows.");
+    let other: u64 = owners
+        .iter()
+        .skip(LISTED_OWNERS)
+        .map(|owner| owner.resident_kib + owner.swapped_kib)
+        .sum();
+    tooltip
+        .line()
+        .label("Other processes: ")
+        .value(&format!("{:.2} GiB", gib(other)));
 }

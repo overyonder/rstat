@@ -10,9 +10,16 @@ fn main() -> ExitCode {
     let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
     let result = match arguments.as_slice() {
         ["daemon"] => rstat::daemon::serve_sections_to_watchers(None),
-        ["daemon", "--config", path] => rstat::daemon::serve_sections_to_watchers(Some(path.as_ref())),
+        ["daemon", "--config", path] => {
+            rstat::daemon::serve_sections_to_watchers(Some(path.as_ref()))
+        }
         ["watch", name] => rstat::section::Section::from_name(name).map_or_else(
-            || Err(format!("unknown section {name}: use cpu, memory, disks, network or gpu").into()),
+            || {
+                Err(
+                    format!("unknown section {name}: use cpu, memory, disks, network or gpu")
+                        .into(),
+                )
+            },
             rstat::watch::print_section_updates,
         ),
         _ => Err("usage: rstat daemon [--config PATH] | rstat watch SECTION".into()),

@@ -12,7 +12,12 @@ use crate::section::{Section, daemon_socket_path};
 /// watcher.
 pub fn print_section_updates(section: Section) -> Result<(), Box<dyn std::error::Error>> {
     let path = daemon_socket_path();
-    let mut stream = UnixStream::connect(&path).map_err(|error| format!("cannot reach the rstat daemon at {}: {error}", path.display()))?;
+    let mut stream = UnixStream::connect(&path).map_err(|error| {
+        format!(
+            "cannot reach the rstat daemon at {}: {error}",
+            path.display()
+        )
+    })?;
     stream.write_all(format!("{}\n", section.name()).as_bytes())?;
     let mut output = std::io::stdout().lock();
     for line in BufReader::new(stream).lines() {

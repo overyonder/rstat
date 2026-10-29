@@ -5,23 +5,27 @@ own counters through file descriptors it keeps open, and serves five Waybar
 modules (CPU, memory, disks, network and NVIDIA GPU), each with a headline and a
 detailed tooltip. A section is sampled only while a Waybar module is watching
 it or an [alert](#alerts) needs it, and a module redraws only when its output
-changes. Alerts run a command, naming the processes responsible, when a figure
+changes. Alerts run a command with process-session measurements when a figure
 stays above a threshold.
 
-Headlines report saturation rather than utilization: how much work is waiting,
-not how busy something is.
+Headlines show CPU load and pressure, available memory, outstanding disk and
+SMB requests, and GPU activity.
 
 | Section | Headline | Tooltip |
 | --- | --- | --- |
 | `cpu` | 1-minute load · CPU pressure | load, pressure, interrupt pressure, utilization, context switches, frequency scaling, fans, CPU temperature, Intel thermal and ACPI throttling |
-| `memory` | memory pressure (all tasks stalled) · available RAM | pressure, swap and paging, refaults, reclaim, compaction, OOM kills, RAM composition, zswap, zram, anonymous RAM and swap by program |
+| `memory` | full memory pressure · available RAM | pressure, swap and paging, refaults, reclaim, compaction, OOM kills, RAM counters, zswap, zram, summed anonymous RSS and swap by program |
 | `disks` | average requests queued on local disks | per-disk busy time, queue, latency and throughput, dirty pages, root filesystem, I/O pressure, tasks blocked in D state |
-| `network` | average NAS (SMB) requests outstanding | NAS request rate and latency, TCP retransmissions and timeouts, listen and buffer errors, interfaces, link use |
+| `network` | SMB requests on the wire now | active VFS operations, completed SMB request rate and latency, TCP retransmissions and timeouts, listen and buffer errors, interfaces, link use |
 | `gpu` | GPU utilization · available VRAM | utilization, encoder and decoder, VRAM, time under each clock-limit policy, clocks, power, temperature headroom, PCIe, VRAM by process |
 
-Each figure that can show strain is coloured green, amber or red against its
-own threshold, and the module's CSS class (`ok`, `warning` or `critical`)
-follows the worst of them.
+Figures are coloured green, amber or red against their thresholds. Each section
+selects its CSS class (`ok`, `warning` or `critical`) from its strain figures.
+
+PSI's `some` measures task stalls and `full` measures productive capacity lost
+to stalls. The kernel aggregates these per CPU, weighted by non-idle activity;
+the two values can be equal while other CPUs are doing work. The displayed
+10-, 60- and 300-second values are the kernel's moving averages.
 
 ### Why load and NAS wait are separated
 
@@ -29,15 +33,16 @@ Linux load average counts tasks in uninterruptible sleep, which includes tasks
 waiting on a network filesystem. A machine with an idle local disk can show a
 load of 30 while it waits on a NAS. Pressure stall information can't separate
 the two either. `rstat` takes the local disk queue from `/sys/block/*/stat`
-(time requests spent queued, per second of wall time) and the NAS queue from the
-SMB client's `/proc/fs/cifs/Stats` (time spent on completed requests, per
-second), so the disk and network headlines say which one is waiting.
+(time requests spent queued or in service, per second of wall time) and current
+SMB requests on the wire from `/proc/fs/cifs/DebugData`. Completed-request
+rates and durations come separately from `/proc/fs/cifs/Stats`, using the
+jiffy frequency declared by each server's table.
 
 ## Design
 
-- **Persistent descriptors.** Every procfs and sysfs file is opened once and
-  re-read with `pread` at offset zero, which makes the kernel regenerate it.
-  There is no per-sample `open`, `close` or process spawn.
+- **Persistent descriptors.** Sampler counters keep their file descriptors and
+  re-read with `pread` at offset zero, which makes the kernel regenerate them.
+  Process discovery and metadata are read as needed.
 - **NVML.** GPU figures come from the NVIDIA Management Library, which
   `nvidia-smi` itself uses, loaded once while the GPU section is watched.
 - **Subscriptions.** The daemon listens on `$XDG_RUNTIME_DIR/rstat.sock`. A
@@ -45,14 +50,11 @@ second), so the disk and network headlines say which one is waiting.
   output changes. A section's sampler, with its descriptors and the driver
   library, is opened with the first watcher and closed with the last.
 - **Expensive work only when needed.** Scanning every thread for D-state tasks
-  costs about 100 ms, so it runs only while `/proc/stat` reports blocked tasks.
+  costs about 100 ms, so it runs only while `/proc/stat` reports I/O waiters.
 - **Memory by program from counters.** The memory section reads `RssAnon` and
   `VmSwap` from each process's `/proc/PID/status`, which the kernel keeps
-  current, rather than the proportional figures in `smaps_rollup`, which cost
-  a page-table walk under each process's memory-map lock and need root. For
-  anonymous RAM the two agree. A swapped page shared by forked processes counts
-  in each of them, so swap can be overstated for programs with forked helpers,
-  such as browsers.
+  current. The table reports sums of anonymous resident-set sizes and swap
+  counters, grouped by program.
 
 ### Cost
 
@@ -193,12 +195,11 @@ line, and `share` the session's fraction of the measured total.
 | `memory.pressure_some`, `memory.pressure_full` | memory pressure, 10 s (%) | anonymous RAM and swap at the end of the window |
 | `disks.queue` | requests queued on local disks | bytes read from and written to block devices in the window |
 | `disks.pressure_some`, `disks.pressure_full` | I/O pressure, 10 s (%) | bytes read from and written to block devices in the window |
-| `network.nas_wait` | NAS (SMB) requests outstanding | threads in D state, averaged over the window |
+| `network.nas_wait` | SMB requests on the wire now | threads in D state, averaged over the window |
 
-Waiting on the NAS puts a task in D state, so blocked threads stand for NAS
-requests. A process whose files the daemon may not read, such as another
-user's I/O counters, is left out. Reading every thread's state costs about
-100 ms, and it happens only while a load or NAS alert is above its threshold.
+Process measurements include readable processes and are grouped by session.
+Reading every thread's state happens only while a load or NAS alert is above
+its threshold.
 
 ## NixOS and Home Manager
 
