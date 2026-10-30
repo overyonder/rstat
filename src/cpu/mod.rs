@@ -281,7 +281,7 @@ impl CpuSampler {
             tooltip
                 .line()
                 .label("Executing: ")
-                .high(busy, &format!("{busy:.1}%"), 80.0, 95.0)
+                .high(busy, &format!("{busy:.1}%"), 95.0, 101.0)
                 .label(" · user ")
                 .value(&format!("{:.1}", percent(user)))
                 .label(" · system ")

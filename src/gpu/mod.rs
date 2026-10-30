@@ -14,12 +14,12 @@ use crate::config::GpuConfig;
 use crate::markup::{Markup, MarkupColors, WaybarReport};
 
 /// Clock-limiting policies whose cumulative violation time NVML reports, and whether time spent under
-/// each one is strain (thermal and board limits) or ordinary operation (power management, low load).
+/// each one is strain (thermal throttling) or ordinary operation (power management, voltage and board limits, low load).
 const VIOLATION_POLICIES: [(PerformancePolicy, &str, bool); 6] = [
     (PerformancePolicy::Power, "power limit", false),
     (PerformancePolicy::Thermal, "thermal", true),
-    (PerformancePolicy::BoardLimit, "board limit", true),
-    (PerformancePolicy::Reliability, "reliability", true),
+    (PerformancePolicy::BoardLimit, "board limit", false),
+    (PerformancePolicy::Reliability, "reliability", false),
     (PerformancePolicy::SyncBoost, "sync boost", false),
     (PerformancePolicy::LowUtilization, "low utilization", false),
 ];
@@ -347,7 +347,7 @@ impl GpuSampler {
                     .filter(|limit| *limit > 0.0);
                 tooltip.line().label("Power: ");
                 if let (Some(power), Some(limit)) = (power_watts, limit_watts) {
-                    tooltip.high(100.0 * power / limit, &format!("{power:.0} W"), 95.0, 101.0);
+                    tooltip.high(100.0 * power / limit, &format!("{power:.0} W"), 95.0, 105.0);
                 } else {
                     tooltip.value(
                         &power_watts
