@@ -166,7 +166,7 @@ impl GpuSampler {
             if items.utilization {
                 tooltip.line().label("GPU active: ");
                 if let Some(percent) = gpu_percent {
-                    tooltip.high(percent, &format!("{percent:.0}%"), 95.0, 101.0);
+                    tooltip.value(&format!("{percent:.0}%"));
                 } else {
                     tooltip.value("N/A");
                 }
@@ -529,7 +529,7 @@ impl GpuSampler {
             }
 
             if let Some(percent) = gpu_percent {
-                headline.high(percent, &format!("{percent:.0}%"), 95.0, 101.0);
+                headline.value(&format!("{percent:.0}%"));
             } else {
                 headline.value("N/A");
             }
